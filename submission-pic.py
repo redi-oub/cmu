@@ -83,52 +83,99 @@ def _make_msg(**kw):
     return m
 
 
-_req_kwarg_names = None  # cached kwarg names for request construction
+# --- Class field introspection (discovers attribute names from actual classes) ---
+_field_cache = {}  # cls -> tuple of field names
 
-def _try_make_req(cls, a, b, c, d):
-    """Try to construct a request object with (a,b,c,d) using various approaches."""
-    global _req_kwarg_names
-    if _req_kwarg_names is not None:
-        try:
-            return cls(**{_req_kwarg_names[0]: a, _req_kwarg_names[1]: b,
-                          _req_kwarg_names[2]: c, _req_kwarg_names[3]: d})
-        except Exception:
-            pass
-    # Try positional first
+
+def _get_fields(cls):
+    """Discover field names of a class using dataclasses.fields or inspect."""
+    if cls in _field_cache:
+        return _field_cache[cls]
+    names = None
     try:
-        obj = cls(a, b, c, d)
-        return obj
+        import dataclasses
+        names = tuple(f.name for f in dataclasses.fields(cls))
     except Exception:
         pass
-    # Try keyword patterns
-    for names in [
-        ('r1', 'c1', 'r2', 'c2'),
-        ('row1', 'col1', 'row2', 'col2'),
-        ('top_row', 'left_col', 'bottom_row', 'right_col'),
-        ('top', 'left', 'bottom', 'right'),
-        ('start_row', 'start_col', 'end_row', 'end_col'),
-        ('min_row', 'min_col', 'max_row', 'max_col'),
-    ]:
+    if names is None:
         try:
-            obj = cls(**{names[0]: a, names[1]: b, names[2]: c, names[3]: d})
-            _req_kwarg_names = names
-            return obj
+            import inspect
+            sig = inspect.signature(cls)
+            names = tuple(p for p in sig.parameters if p != 'self')
         except Exception:
             pass
+    if names is None:
+        # Try constructing a dummy and reading __dict__ key order
+        try:
+            obj = cls(0, 0, 0, 0)
+            names = tuple(k for k in obj.__dict__ if not k.startswith('_'))
+        except Exception:
+            pass
+    _field_cache[cls] = names
+    return names
+
+
+def _make_req(cls, a, b, c, d):
+    """Construct a request using introspected field names, positional, or kwargs."""
+    fields = _get_fields(cls)
+    if fields and len(fields) >= 4:
+        try:
+            return cls(**{fields[0]: a, fields[1]: b, fields[2]: c, fields[3]: d})
+        except Exception:
+            pass
+    try:
+        return cls(a, b, c, d)
+    except Exception:
+        pass
+    return None
+
+
+def _get_rect(req):
+    """Extract (r1,c1,r2,c2) from a request using introspected field names."""
+    cls = type(req)
+    fields = _get_fields(cls)
+    if fields and len(fields) >= 4:
+        try:
+            return tuple(int(getattr(req, fields[i])) for i in range(4))
+        except Exception:
+            pass
+    # Fallback: try __dict__ ordered values
+    if hasattr(req, '__dict__'):
+        vals = [v for k, v in req.__dict__.items()
+                if not k.startswith('_') and isinstance(v, (int, float))]
+        if len(vals) >= 4:
+            return tuple(int(v) for v in vals[:4])
     return None
 
 
 class SubmissionStrategy(Strategy):
 
     def __init__(self, corrupted):
-        super().__init__(corrupted)
         self._t0 = time.time()
         self._init_ok = False
+        self.n = 50
+        self.bs = 10
+        self.corrupted = corrupted
+        self.req_meta = []
+        self.recv_avgs = {}
+        self.recv_pixels = {}
+        self.recv_quad_avgs = {}
+        self.global_mean = 0.5
+        self.is_binary = False
+        self.image = [[0.5] * 50 for _ in range(50)]
+        self.mask = [[False] * 50 for _ in range(50)]
+        self.visible = set()
+        self.missing = set()
+        self.vis_means = {}
+        try:
+            super().__init__(corrupted)
+            self._do_init(corrupted)
+        except BaseException:
+            pass
+
+    def _do_init(self, corrupted):
         N = 50
         BS = 10
-        self.n = N
-        self.bs = BS
-        self.corrupted = corrupted
 
         img = [[0.0] * N for _ in range(N)]
         mask = [[False] * N for _ in range(N)]
@@ -142,37 +189,41 @@ class SubmissionStrategy(Strategy):
         self.image = img
         self.mask = mask
 
-        self.visible = set()
-        self.missing = set()
+        visible = set()
+        missing = set()
         for br in range(5):
             for bc in range(5):
                 if mask[br * BS][bc * BS]:
-                    self.visible.add((br, bc))
+                    visible.add((br, bc))
                 else:
-                    self.missing.add((br, bc))
+                    missing.add((br, bc))
+        self.visible = visible
+        self.missing = missing
 
-        self.vis_means = {}
+        vis_means = {}
         all_vals = []
-        for br, bc in self.visible:
+        for br, bc in visible:
             s = 0.0
             for r in range(br * BS, br * BS + BS):
                 for c in range(bc * BS, bc * BS + BS):
                     s += img[r][c]
-            self.vis_means[(br, bc)] = s / (BS * BS)
+            vis_means[(br, bc)] = s / (BS * BS)
             for r in range(br * BS, br * BS + BS):
                 for c in range(bc * BS, bc * BS + BS):
                     all_vals.append(img[r][c])
+        self.vis_means = vis_means
 
         self.global_mean = sum(all_vals) / len(all_vals) if all_vals else 0.5
         self.is_binary = self._detect_binary(all_vals)
-
-        self.req_meta = []
-        self.recv_avgs = {}
-        self.recv_pixels = {}
-        self.recv_quad_avgs = {}
         self._init_ok = True
 
     def make_requests(self):
+        try:
+            return self._do_make_requests()
+        except BaseException:
+            return []
+
+    def _do_make_requests(self):
         if not self._init_ok:
             return []
         _ensure_types()
@@ -184,14 +235,14 @@ class SubmissionStrategy(Strategy):
         sm = sorted(self.missing)
 
         def _avg(a, b, c, d):
-            obj = _try_make_req(RegionAverageRequest, a, b, c, d)
+            obj = _make_req(RegionAverageRequest, a, b, c, d)
             if obj is not None:
                 reqs.append(obj)
                 return True
             return False
 
         def _reg(a, b, c, d):
-            obj = _try_make_req(RegionRequest, a, b, c, d)
+            obj = _make_req(RegionRequest, a, b, c, d)
             if obj is not None:
                 reqs.append(obj)
                 return True
@@ -238,20 +289,30 @@ class SubmissionStrategy(Strategy):
         return reqs
 
     def receive_requests(self, requests):
-        _ensure_types()
-        responses = []
-        answered = 0
-        for req in requests:
-            if answered >= 12:
-                responses.append(None)
-                continue
-            resp = self._respond(req)
-            responses.append(resp)
-            if resp is not None:
-                answered += 1
-        return responses
+        try:
+            _ensure_types()
+            responses = []
+            answered = 0
+            for req in requests:
+                if answered >= 12:
+                    responses.append(None)
+                    continue
+                resp = self._respond(req)
+                responses.append(resp)
+                if resp is not None:
+                    answered += 1
+            return responses
+        except BaseException:
+            return [None] * len(requests)
 
     def receive_messages(self, messages):
+        try:
+            self._do_receive_messages(messages)
+        except BaseException:
+            pass
+
+    def _do_receive_messages(self, messages):
+        msg_fields = None
         for i, msg in enumerate(messages):
             if msg is None or i >= len(self.req_meta):
                 continue
@@ -266,8 +327,24 @@ class SubmissionStrategy(Strategy):
             elif m[0] == "qavg":
                 self.recv_quad_avgs[(m[3], m[4], m[5], m[6])] = val
             elif m[0] == "pix":
-                row = getattr(msg, 'row', None)
-                col = getattr(msg, 'col', None)
+                row = None
+                col = None
+                if msg_fields is None:
+                    msg_fields = _get_fields(type(msg))
+                if msg_fields:
+                    for fn in msg_fields:
+                        v = getattr(msg, fn, None)
+                        if v is None:
+                            continue
+                        fl = fn.lower()
+                        if row is None and ('row' in fl or fl == 'r' or fl == 'y'):
+                            row = v
+                        elif col is None and ('col' in fl or fl == 'c' or fl == 'x'):
+                            col = v
+                if row is None:
+                    row = getattr(msg, 'row', None)
+                if col is None:
+                    col = getattr(msg, 'col', None)
                 if row is not None and col is not None:
                     self.recv_pixels[(row, col)] = val
                 else:
@@ -276,8 +353,10 @@ class SubmissionStrategy(Strategy):
     def recover(self):
         try:
             return self._do_recover()
-        except Exception:
-            # Fallback: return corrupted image with 0.5 for missing
+        except BaseException:
+            pass
+        # Fallback: return corrupted image with 0.5 for missing
+        try:
             N = self.n
             result = []
             for r in range(N):
@@ -287,6 +366,8 @@ class SubmissionStrategy(Strategy):
                     row.append(v if v is not None else 0.5)
                 result.append(row)
             return result
+        except BaseException:
+            return [[0.5] * 50 for _ in range(50)]
 
     def _do_recover(self):
         N = self.n
@@ -585,38 +666,7 @@ class SubmissionStrategy(Strategy):
 
     @staticmethod
     def _rect(req):
-        """Extract (r1,c1,r2,c2) from a request object regardless of attr names."""
-        # Try known naming conventions in order
-        for names in [
-            ('r1', 'c1', 'r2', 'c2'),
-            ('row1', 'col1', 'row2', 'col2'),
-            ('top_row', 'left_col', 'bottom_row', 'right_col'),
-            ('top', 'left', 'bottom', 'right'),
-            ('start_row', 'start_col', 'end_row', 'end_col'),
-            ('min_row', 'min_col', 'max_row', 'max_col'),
-            ('y1', 'x1', 'y2', 'x2'),
-            ('x1', 'y1', 'x2', 'y2'),
-        ]:
-            vals = [getattr(req, n, None) for n in names]
-            if all(v is not None for v in vals):
-                return tuple(int(v) for v in vals)
-        # Fallback: grab all int attributes sorted by name
-        d = {}
-        for attr in dir(req):
-            if attr.startswith('_'):
-                continue
-            v = getattr(req, attr, None)
-            if isinstance(v, (int, float)) and not callable(v):
-                d[attr] = v
-        if len(d) >= 4:
-            keys = sorted(d.keys())
-            return tuple(int(d[k]) for k in keys[:4])
-        # Last resort: try __dict__
-        if hasattr(req, '__dict__'):
-            vals = [v for v in req.__dict__.values() if isinstance(v, (int, float))]
-            if len(vals) >= 4:
-                return tuple(int(v) for v in vals[:4])
-        return None
+        return _get_rect(req)
 
     def _respond(self, req):
         try:
@@ -633,15 +683,15 @@ class SubmissionStrategy(Strategy):
                 return self._resp_split(req)
             if 'Region' in cls_name:
                 return self._resp_region(req)
-            rect = self._rect(req)
+            rect = _get_rect(req)
             if rect is not None:
                 return self._resp_region(req)
-        except Exception:
+        except BaseException:
             pass
         return None
 
     def _resp_avg(self, req):
-        rect = self._rect(req)
+        rect = _get_rect(req)
         if rect is None:
             return None
         rr1, cc1, rr2, cc2 = rect
@@ -656,7 +706,7 @@ class SubmissionStrategy(Strategy):
         return _make_msg(value=total / cnt)
 
     def _resp_region(self, req):
-        rect = self._rect(req)
+        rect = _get_rect(req)
         if rect is None:
             return None
         rr1, cc1, rr2, cc2 = rect
@@ -677,7 +727,7 @@ class SubmissionStrategy(Strategy):
         return _make_msg(row=best[0], col=best[1], value=best[2])
 
     def _resp_split(self, req):
-        rect = self._rect(req)
+        rect = _get_rect(req)
         if rect is None:
             return None
         rr1, cc1, rr2, cc2 = rect
@@ -693,8 +743,16 @@ class SubmissionStrategy(Strategy):
             return None
         if isinstance(msg, (int, float)):
             return float(msg)
+        # Try known names first
         for attr in ("value", "mean", "average", "val"):
             v = getattr(msg, attr, None)
             if v is not None:
                 return float(v)
+        # Try introspected fields - first float field is likely the value
+        fields = _get_fields(type(msg))
+        if fields:
+            for fn in fields:
+                v = getattr(msg, fn, None)
+                if isinstance(v, (int, float)):
+                    return float(v)
         return None
