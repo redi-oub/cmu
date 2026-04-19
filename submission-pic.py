@@ -1,111 +1,69 @@
-"""
-CMIMC PIC – Image Recovery Strategy (Optimized v4)
-"""
-from __future__ import annotations
+"""CMIMC PIC - Image Recovery Strategy"""
 import sys
-import os
-from typing import Optional
 
-def _dbg(msg):
-    """Write debug info to stderr so it doesn't corrupt stdout JSON."""
+# --- Import Strategy at module level (needed for class definition) ---
+Strategy = None
+for _mn in ['strategy', 'game', 'game_types']:
     try:
-        print(f"[DBG] {msg}", file=sys.stderr, flush=True)
+        _m = __import__(_mn)
+        if hasattr(_m, 'Strategy'):
+            Strategy = _m.Strategy
+            break
     except Exception:
         pass
-
-def _get(name):
-    """Safely get a name from __main__ or known modules."""
-    # 1) Check __main__ first (parse.py runs as __main__)
-    main = sys.modules.get('__main__')
-    if main is not None:
-        try:
-            v = getattr(main, name, None)
-            if v is not None:
-                _dbg(f"Found {name} in __main__: {v}")
-                return v
-        except Exception:
-            pass
-    # 2) Check specific safe module names
-    for mod_name in ['strategy', 'game', 'game_types']:
-        mod = sys.modules.get(mod_name)
-        if mod is not None:
-            try:
-                v = getattr(mod, name, None)
-                if v is not None:
-                    _dbg(f"Found {name} in sys.modules[{mod_name}]: {v}")
-                    return v
-            except Exception:
-                pass
-        else:
-            try:
-                mod = __import__(mod_name)
-                v = getattr(mod, name, None)
-                if v is not None:
-                    _dbg(f"Found {name} via import {mod_name}: {v}")
-                    return v
-            except Exception:
-                pass
-    _dbg(f"NOT FOUND: {name}")
-    return None
-
-
-# Debug: list all modules and files at import time
-_dbg(f"Python {sys.version}")
-_dbg(f"__file__={__file__}, cwd={os.getcwd()}")
-_dbg(f"sys.modules keys: {sorted(sys.modules.keys())}")
-try:
-    app_dir = os.path.dirname(os.path.abspath(__file__))
-    _dbg(f"Files in {app_dir}: {os.listdir(app_dir)}")
-except Exception as e:
-    _dbg(f"listdir error: {e}")
-
-# Strategy is needed at import time for class definition
-_dbg("Looking for Strategy...")
-Strategy = _get('Strategy')
 if Strategy is None:
-    _dbg("Strategy NOT FOUND - using fallback")
+    _main = sys.modules.get('__main__')
+    if _main and hasattr(_main, 'Strategy'):
+        Strategy = _main.Strategy
+if Strategy is None:
     class Strategy:
         def __init__(self, corrupted):
-            self.corrupted_image = corrupted
-else:
-    _dbg(f"Strategy = {Strategy}")
+            pass
 
-# These will be resolved lazily since parse.py may define them AFTER importing us
+# --- Lazy-resolved types (defined by server AFTER importing us) ---
 RegionRequest = None
 RegionAverageRequest = None
 SplitRequest = None
 Message = None
 _types_resolved = False
 
+
 def _ensure_types():
-    """Lazily resolve request/message types (called on first use)."""
     global RegionRequest, RegionAverageRequest, SplitRequest, Message, _types_resolved
     if _types_resolved:
         return
     _types_resolved = True
-    _dbg("_ensure_types() running...")
-    _dbg(f"sys.modules keys now: {sorted(sys.modules.keys())}")
-    main = sys.modules.get('__main__')
-    if main is not None:
-        _dbg(f"__main__ dir: {[x for x in dir(main) if not x.startswith('_')]}")
-    RegionRequest = _get('RegionRequest')
-    RegionAverageRequest = _get('RegionAverageRequest')
-    SplitRequest = _get('SplitRequest')
-    Message = _get('Message')
-    _dbg(f"Resolved: RR={RegionRequest}, RAR={RegionAverageRequest}, SR={SplitRequest}, M={Message}")
-    if Message is None:
-        _dbg("Message NOT FOUND - using fallback")
+    for name in ['RegionRequest', 'RegionAverageRequest', 'SplitRequest', 'Message']:
+        val = None
+        _main = sys.modules.get('__main__')
+        if _main:
+            val = getattr(_main, name, None)
+        if val is None:
+            for _mn in ['strategy', 'game', 'game_types']:
+                _m = sys.modules.get(_mn)
+                if _m:
+                    val = getattr(_m, name, None)
+                    if val is not None:
+                        break
+                else:
+                    try:
+                        _m = __import__(_mn)
+                        val = getattr(_m, name, None)
+                        if val is not None:
+                            break
+                    except Exception:
+                        pass
+        globals()[name] = val
+    if globals()['Message'] is None:
         class _Msg:
             def __init__(self, **kw):
-                for k, v in kw.items():
-                    setattr(self, k, v)
-        Message = _Msg
+                self.__dict__.update(kw)
+        globals()['Message'] = _Msg
 
 
 class SubmissionStrategy(Strategy):
 
-    def __init__(self, corrupted: list[list[Optional[float]]]):
-        _dbg("SubmissionStrategy.__init__ called")
+    def __init__(self, corrupted):
         super().__init__(corrupted)
         N = 50
         BS = 10
@@ -113,7 +71,6 @@ class SubmissionStrategy(Strategy):
         self.bs = BS
         self.corrupted = corrupted
 
-        # Build image / mask arrays
         img = [[0.0] * N for _ in range(N)]
         mask = [[False] * N for _ in range(N)]
         for r in range(N):
@@ -126,9 +83,8 @@ class SubmissionStrategy(Strategy):
         self.image = img
         self.mask = mask
 
-        # Classify blocks
-        self.visible: set[tuple[int, int]] = set()
-        self.missing: set[tuple[int, int]] = set()
+        self.visible = set()
+        self.missing = set()
         for br in range(5):
             for bc in range(5):
                 if mask[br * BS][bc * BS]:
@@ -136,9 +92,8 @@ class SubmissionStrategy(Strategy):
                 else:
                     self.missing.add((br, bc))
 
-        # Block means for visible blocks
-        self.vis_means: dict[tuple[int, int], float] = {}
-        all_vals: list[float] = []
+        self.vis_means = {}
+        all_vals = []
         for br, bc in self.visible:
             s = 0.0
             for r in range(br * BS, br * BS + BS):
@@ -152,48 +107,40 @@ class SubmissionStrategy(Strategy):
         self.global_mean = sum(all_vals) / len(all_vals) if all_vals else 0.5
         self.is_binary = self._detect_binary(all_vals)
 
-        self.req_meta: list[tuple] = []
-        self.recv_avgs: dict[tuple[int, int], float] = {}
-        self.recv_pixels: dict[tuple[int, int], float] = {}
-        self.recv_quad_avgs: dict[tuple, float] = {}
+        self.req_meta = []
+        self.recv_avgs = {}
+        self.recv_pixels = {}
+        self.recv_quad_avgs = {}
 
-    # --------------------------------------------------------- make_requests
-    def make_requests(self) -> list:
-        _dbg("make_requests() called")
+    def make_requests(self):
         _ensure_types()
-        _dbg(f"Types after ensure: RAR={RegionAverageRequest}, RR={RegionRequest}, M={Message}")
-        reqs: list = []
-        meta: list[tuple] = []
+        reqs = []
+        meta = []
         BS = self.bs
         sm = sorted(self.missing)
 
-        # Pass 1: block averages (highest priority)
         for br, bc in sm:
             r1, c1 = br * BS, bc * BS
             reqs.append(RegionAverageRequest(r1, c1, r1 + 9, c1 + 9))
             meta.append(("avg", br, bc))
 
-        # Pass 2: center pixel per block
         for br, bc in sm:
             r1, c1 = br * BS, bc * BS
             reqs.append(RegionRequest(r1 + 5, c1 + 5, r1 + 5, c1 + 5))
             meta.append(("pix", br, bc, r1 + 5, c1 + 5))
 
-        # Pass 3: 4-corner pixels per block
         for br, bc in sm:
             r1, c1 = br * BS, bc * BS
             for dr, dc in [(2, 2), (2, 7), (7, 2), (7, 7)]:
                 reqs.append(RegionRequest(r1+dr, c1+dc, r1+dr, c1+dc))
                 meta.append(("pix", br, bc, r1+dr, c1+dc))
 
-        # Pass 4: edge centres
         for br, bc in sm:
             r1, c1 = br * BS, bc * BS
             for pr, pc in [(r1, c1+5), (r1+9, c1+5), (r1+5, c1), (r1+5, c1+9)]:
                 reqs.append(RegionRequest(pr, pc, pr, pc))
                 meta.append(("pix", br, bc, pr, pc))
 
-        # Pass 5: quadrant averages
         for br, bc in sm:
             r1, c1 = br * BS, bc * BS
             for qr1, qc1, qr2, qc2 in [
@@ -203,7 +150,6 @@ class SubmissionStrategy(Strategy):
                 reqs.append(RegionAverageRequest(qr1, qc1, qr2, qc2))
                 meta.append(("qavg", br, bc, qr1, qc1, qr2, qc2))
 
-        # Pass 6: denser pixel grid
         for br, bc in sm:
             r1, c1 = br * BS, bc * BS
             for dr, dc in [(1,5),(5,1),(5,8),(8,5),(3,3),(3,6),(6,3),(6,6)]:
@@ -211,13 +157,11 @@ class SubmissionStrategy(Strategy):
                 meta.append(("pix", br, bc, r1+dr, c1+dc))
 
         self.req_meta = meta
-        _dbg(f"make_requests returning {len(reqs)} requests")
         return reqs
 
-    # ------------------------------------------------------ receive_requests
-    def receive_requests(self, requests: list) -> list:
-        _dbg(f"receive_requests called with {len(requests)} requests")
-        responses: list = []
+    def receive_requests(self, requests):
+        _ensure_types()
+        responses = []
         answered = 0
         for req in requests:
             if answered >= 12:
@@ -229,9 +173,7 @@ class SubmissionStrategy(Strategy):
                 answered += 1
         return responses
 
-    # ------------------------------------------------------ receive_messages
-    def receive_messages(self, messages: list) -> None:
-        _dbg(f"receive_messages called with {len(messages)} messages")
+    def receive_messages(self, messages):
         for i, msg in enumerate(messages):
             if msg is None or i >= len(self.req_meta):
                 continue
@@ -253,23 +195,18 @@ class SubmissionStrategy(Strategy):
                 else:
                     self.recv_pixels[(m[3], m[4])] = val
 
-    # ---------------------------------------------------------------- recover
-    def recover(self) -> list[list[Optional[float]]]:
-        _dbg(f"recover() called. recv_avgs={len(self.recv_avgs)}, recv_pixels={len(self.recv_pixels)}, recv_quads={len(self.recv_quad_avgs)}")
-        _dbg(f"is_binary={self.is_binary}, visible={len(self.visible)}, missing={len(self.missing)}")
+    def recover(self):
         N = self.n
         BS = self.bs
         img = self.image
         mask = self.mask
 
-        # === Phase 0: Denoise visible blocks ===
         if self.is_binary:
             for r in range(N):
                 for c in range(N):
                     if mask[r][c]:
                         img[r][c] = 1.0 if img[r][c] >= 0.5 else 0.0
 
-        # === Phase 1: Place received pixel values ===
         for (r, c), v in self.recv_pixels.items():
             if 0 <= r < N and 0 <= c < N:
                 if self.is_binary:
@@ -277,13 +214,11 @@ class SubmissionStrategy(Strategy):
                 img[r][c] = v
                 mask[r][c] = True
 
-        # === Phase 2: Reconstruct missing blocks ===
         if self.is_binary:
             self._recover_binary(img, mask)
         else:
             self._recover_continuous(img, mask)
 
-        # Final clamp
         for r in range(N):
             for c in range(N):
                 v = img[r][c]
@@ -294,20 +229,17 @@ class SubmissionStrategy(Strategy):
                 elif v > 1.0:
                     img[r][c] = 1.0
 
-        _dbg(f"recover() done. Sample pixel values: {[img[0][c] for c in range(5)]}")
         return img
 
     def _recover_binary(self, img, mask):
-        """Reconstruct missing blocks for binary images using diffusion + proportion threshold."""
         N = self.n
         BS = self.bs
 
-        # IDW initialization from boundary + received pixels
         for br, bc in self.missing:
             r1, c1 = br * BS, bc * BS
             block_avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
 
-            refs: list[tuple[int, int, float]] = []
+            refs = []
             if br > 0 and (br - 1, bc) in self.visible:
                 for c in range(c1, c1 + BS):
                     refs.append((r1 - 1, c, img[r1 - 1][c]))
@@ -321,7 +253,6 @@ class SubmissionStrategy(Strategy):
                 for r in range(r1, r1 + BS):
                     refs.append((r, c1 + BS, img[r][c1 + BS]))
 
-            # Diagonal corners
             for dbr, dbc in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
                 nbr, nbc = br + dbr, bc + dbc
                 if (nbr, nbc) in self.visible:
@@ -350,8 +281,7 @@ class SubmissionStrategy(Strategy):
                     else:
                         img[r][c] = block_avg
 
-        # SOR diffusion
-        non_fixed: list[tuple[int, int]] = []
+        non_fixed = []
         for r in range(N):
             for c in range(N):
                 if not mask[r][c]:
@@ -374,7 +304,6 @@ class SubmissionStrategy(Strategy):
             if max_change < 1e-5:
                 break
 
-        # Proportion-matched thresholding per missing block
         for br, bc in self.missing:
             avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
             r1, c1 = br * BS, bc * BS
@@ -387,16 +316,12 @@ class SubmissionStrategy(Strategy):
             for i, (_, r, c) in enumerate(pixels):
                 img[r][c] = 1.0 if i < count_1 else 0.0
 
-
-
     def _recover_continuous(self, img, mask):
-        """Reconstruct missing blocks for continuous images."""
         N = self.n
         BS = self.bs
         quad_avgs = self.recv_quad_avgs
 
-        # Detect uniform missing blocks
-        uniform_blocks: set[tuple[int, int]] = set()
+        uniform_blocks = set()
         for br, bc in self.missing:
             avg = self.recv_avgs.get((br, bc))
             if avg is None:
@@ -415,14 +340,13 @@ class SubmissionStrategy(Strategy):
                                 img[r][c] = avg
                                 mask[r][c] = True
 
-        # IDW initialization for non-uniform missing blocks
         for br, bc in self.missing:
             if (br, bc) in uniform_blocks:
                 continue
             r1, c1 = br * BS, bc * BS
             block_avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
 
-            refs: list[tuple[int, int, float]] = []
+            refs = []
             if br > 0 and (br - 1, bc) in self.visible:
                 for c in range(c1, c1 + BS):
                     refs.append((r1 - 1, c, img[r1 - 1][c]))
@@ -480,9 +404,8 @@ class SubmissionStrategy(Strategy):
                     else:
                         img[r][c] = block_avg
 
-        # SOR diffusion for missing pixels
         fixed = [[False] * N for _ in range(N)]
-        non_fixed: list[tuple[int, int]] = []
+        non_fixed = []
         for r in range(N):
             for c in range(N):
                 if mask[r][c]:
@@ -507,7 +430,6 @@ class SubmissionStrategy(Strategy):
             if max_change < 1e-5:
                 break
 
-        # Enforce average constraint
         for br, bc in self.missing:
             if (br, bc) in uniform_blocks:
                 continue
@@ -541,10 +463,8 @@ class SubmissionStrategy(Strategy):
                         if not fixed[r][c]:
                             img[r][c] = max(0.0, min(1.0, img[r][c] + shift))
 
-    # ============================================================== helpers
-
     @staticmethod
-    def _detect_binary(all_vals: list[float]) -> bool:
+    def _detect_binary(all_vals):
         if len(all_vals) < 100:
             return False
         near_0 = sum(1 for v in all_vals if v < 0.3)
@@ -553,7 +473,7 @@ class SubmissionStrategy(Strategy):
         total = len(all_vals)
         return (near_0 + near_1) / total > 0.60 and mid / total < 0.25
 
-    def _neighbor_avg(self, br: int, bc: int) -> float:
+    def _neighbor_avg(self, br, bc):
         total, cnt = 0.0, 0
         for dbr in (-1, 0, 1):
             for dbc in (-1, 0, 1):
@@ -566,27 +486,25 @@ class SubmissionStrategy(Strategy):
                     total += self.recv_avgs[nb]; cnt += 1
         return total / cnt if cnt > 0 else self.global_mean
 
-    def _respond(self, req) -> Optional[Message]:
+    def _respond(self, req):
         if RegionAverageRequest is not None and isinstance(req, RegionAverageRequest):
             return self._resp_avg(req)
         if RegionRequest is not None and isinstance(req, RegionRequest):
             return self._resp_region(req)
         if SplitRequest is not None and isinstance(req, SplitRequest):
             return self._resp_split(req)
-        # Fallback: detect request type by attribute names
         cls_name = type(req).__name__
-        if 'Average' in cls_name or 'average' in cls_name:
+        if 'Average' in cls_name:
             return self._resp_avg(req)
-        if 'Split' in cls_name or 'split' in cls_name:
+        if 'Split' in cls_name:
             return self._resp_split(req)
-        if 'Region' in cls_name or 'region' in cls_name:
+        if 'Region' in cls_name:
             return self._resp_region(req)
-        # Last resort: if it has r1/c1/r2/c2, treat as region request
         if hasattr(req, 'r1') and hasattr(req, 'c1'):
             return self._resp_region(req)
         return None
 
-    def _resp_avg(self, req) -> Optional[Message]:
+    def _resp_avg(self, req):
         total, cnt = 0.0, 0
         for r in range(max(0, req.r1), min(self.n, req.r2 + 1)):
             for c in range(max(0, req.c1), min(self.n, req.c2 + 1)):
@@ -597,7 +515,7 @@ class SubmissionStrategy(Strategy):
             return None
         return Message(value=total / cnt)
 
-    def _resp_region(self, req) -> Optional[Message]:
+    def _resp_region(self, req):
         cr = (req.r1 + req.r2) * 0.5
         cc = (req.c1 + req.c2) * 0.5
         best = None
@@ -614,7 +532,7 @@ class SubmissionStrategy(Strategy):
             return None
         return Message(row=best[0], col=best[1], value=best[2])
 
-    def _resp_split(self, req) -> Optional[Message]:
+    def _resp_split(self, req):
         v1 = self.corrupted[req.r1][req.c1] if 0 <= req.r1 < self.n and 0 <= req.c1 < self.n else None
         v2 = self.corrupted[req.r2][req.c2] if 0 <= req.r2 < self.n and 0 <= req.c2 < self.n else None
         if v1 is None or v2 is None:
@@ -622,7 +540,7 @@ class SubmissionStrategy(Strategy):
         return Message(value=1.0 if abs(v1 - v2) > 0.15 else 0.0)
 
     @staticmethod
-    def _extract_value(msg) -> Optional[float]:
+    def _extract_value(msg):
         if msg is None:
             return None
         if isinstance(msg, (int, float)):
