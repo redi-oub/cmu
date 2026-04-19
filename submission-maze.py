@@ -144,11 +144,25 @@ def _dfs_next_action(pos, neighbors, visited, sweep_count, stack):
     return -1, visited, sweep_count, stack
 
 
-def _stop_threshold(step):
-    """Coin threshold for bot to stop DFS and start spinning at a slot.
-    Starts high (only ghost-signaled slots), decays to accept any decent slot.
+def _stop_threshold(step, total_steps):
+    """Coin threshold for bot to stop DFS and start spinning.
+    Early: only ghost-signaled slots (high threshold).
+    Late: accept any decent slot.
+    Very late: take anything with coins.
     """
-    return max(5, 50 - step // 8)
+    remaining = total_steps - step
+    if remaining > 1800:
+        return 45
+    elif remaining > 1200:
+        return 35
+    elif remaining > 800:
+        return 25
+    elif remaining > 500:
+        return 15
+    elif remaining > 200:
+        return 8
+    else:
+        return 3
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +192,7 @@ def SubmissionBot(
         return -1, data
 
     # Phase 0: DFS exploration — check if we should stop here
-    if has_slot and slot_coins >= _stop_threshold(step):
+    if has_slot and slot_coins >= _stop_threshold(step, total_steps):
         packed = _pack_bot_state(True, None, 0, [])
         return -1, packed
 
@@ -321,11 +335,18 @@ def _find_next_bot_visit(visits, after_step):
     return visits[lo] if lo < len(visits) else None
 
 
+def _est_alpha(state, v):
+    """Estimate α for slot at vertex v. α ~ Uniform[0, 3*d(0,v)), E[α]=1.5*d."""
+    d0 = state.dist_from_0[v] if v < len(state.dist_from_0) else -1
+    if d0 <= 0:
+        return 0.5
+    return max(0.5, 1.5 * d0)
+
+
 def _ghost_pick_beacon(state, ghost_pos, current_step, total_steps):
-    """Pick the best slot for the ghost to use as a beacon.
-    For each slot, finds the NEXT bot visit after ghost can arrive and fill it.
-    Score = (total_steps - bot_visit_step) × expected_α.
-    The bot will stop there (coins ≥ threshold) and spin for the remainder.
+    """Pick the best slot for ghost beacon.
+    For each slot, find the earliest bot visit where ghost can fill enough
+    coins to exceed the bot's threshold. Score = remaining_steps * est_α.
     """
     if not state.slot_set or state.apsp_dist is None:
         return None
@@ -339,63 +360,59 @@ def _ghost_pick_beacon(state, ghost_pos, current_step, total_steps):
         if ghost_travel >= 9999:
             continue
 
-        d0 = state.dist_from_0[v]
-        if d0 < 0:
-            continue
-        est_alpha = max(0.5, 1.5 * d0)
-
+        alpha = _est_alpha(state, v)
+        mean_spin = alpha * 2.3  # E[spin] ≈ α·ln(10)
         ghost_arrival = current_step + ghost_travel
-        # Ghost needs ≥3 spins to accumulate enough coins above threshold
-        min_fill_time = max(3, int(5.0 / max(0.1, est_alpha * 2.3)) + 1)
-        earliest_bot_ok = ghost_arrival + min_fill_time
-
         visits = state.slot_visit_steps.get(v, [])
-        bot_visit = _find_next_bot_visit(visits, earliest_bot_ok)
-        if bot_visit is None:
-            continue
 
-        # The bot will stop here and spin for (total_steps - bot_visit) steps
-        remaining_spins = total_steps - bot_visit
-        if remaining_spins <= 0:
-            continue
-        score = remaining_spins * est_alpha
-        if score > best_score:
-            best_score = score
-            best_v = v
-            best_bot_visit = bot_visit
+        # Find earliest bot visit where ghost has filled enough coins
+        for min_fill in [2, 4, 8, 15, 25]:
+            earliest = ghost_arrival + min_fill
+            bot_visit = _find_next_bot_visit(visits, earliest)
+            if bot_visit is None:
+                continue
+            fill_spins = bot_visit - ghost_arrival
+            expected_coins = min(50, fill_spins * mean_spin)
+            threshold = _stop_threshold(bot_visit, total_steps)
+            if expected_coins >= threshold:
+                remaining = total_steps - bot_visit
+                if remaining <= 0:
+                    continue
+                score = remaining * alpha
+                if score > best_score:
+                    best_score = score
+                    best_v = v
+                    best_bot_visit = bot_visit
+                break
 
     if best_v is not None:
         state.beacon_bot_visit_step = best_bot_visit
         return best_v
 
-    # Fallback: pick highest-α slot, ghost fills it, bot's threshold eventually
-    # drops low enough to stop there on a future DFS pass
+    # Fallback: highest-α slot
     best_alpha = -1.0
     for v in state.slot_set:
         ghost_travel = state.apsp_dist[ghost_pos][v]
         if ghost_travel >= 9999:
             continue
-        d0 = state.dist_from_0[v]
-        if d0 < 0:
-            continue
-        est_alpha = max(0.5, 1.5 * d0)
-        if est_alpha > best_alpha:
-            best_alpha = est_alpha
+        alpha = _est_alpha(state, v)
+        if alpha > best_alpha:
+            best_alpha = alpha
             best_v = v
 
     if best_v is not None:
-        # Find earliest bot visit to this slot
         visits = state.slot_visit_steps.get(best_v, [])
         ghost_travel = state.apsp_dist[ghost_pos][best_v]
         ghost_arrival = current_step + ghost_travel
         bot_visit = _find_next_bot_visit(visits, ghost_arrival + 1)
-        state.beacon_bot_visit_step = bot_visit if bot_visit else None
+        state.beacon_bot_visit_step = bot_visit
     return best_v
 
 
 def _ghost_pick_farm_target(state, ghost_pos, current_step, total_steps):
-    """Pick a secondary slot for the ghost to farm after beacon is placed.
-    Prioritize slots the bot will visit on its DFS path (before it stops).
+    """Pick the best slot for ghost to farm permanently after beacon.
+    Prefer high-α slots that the bot will visit to collect coins.
+    Ghost stays at this slot permanently, accumulating coins for bot pickup.
     """
     if not state.slot_set or state.apsp_dist is None:
         return None
@@ -405,36 +422,48 @@ def _ghost_pick_farm_target(state, ghost_pos, current_step, total_steps):
 
     for v in state.slot_set:
         if v == state.bot_settled_pos:
-            continue  # bot is spinning here, ghost spinning is wasted
+            continue
         ghost_travel = state.apsp_dist[ghost_pos][v]
         if ghost_travel >= 9999:
             continue
 
-        d0 = state.dist_from_0[v]
-        if d0 < 0:
-            continue
-        est_alpha = max(0.5, 1.5 * d0)
-        est_value_per_spin = est_alpha * 2.3
-
+        alpha = _est_alpha(state, v)
+        mean_spin = alpha * 2.3
         ghost_arrival = current_step + ghost_travel
+        remaining = total_steps - ghost_arrival
+        if remaining <= 0:
+            continue
 
-        # Find next bot visit to this slot after ghost arrives
+        # Estimate total coins bot will collect from this slot
         visits = state.slot_visit_steps.get(v, [])
-        bot_visit = _find_next_bot_visit(visits, int(ghost_arrival))
-        if bot_visit is None or state.bot_settled:
-            bot_visit = total_steps + 1
+        lo, hi = 0, len(visits)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if visits[mid] < ghost_arrival:
+                lo = mid + 1
+            else:
+                hi = mid
 
-        # Coins ghost can accumulate before bot arrives (capped at 50)
-        spins_available = max(0, bot_visit - ghost_arrival)
-        est_coins = min(50, spins_available * est_value_per_spin)
+        total_collectible = 0.0
+        prev_time = ghost_arrival
+        for i in range(lo, len(visits)):
+            bot_step = visits[i]
+            if state.bot_settled:
+                break  # Bot won't visit after settling
+            spins = bot_step - prev_time
+            coins = min(50, spins * mean_spin)
+            total_collectible += coins
+            prev_time = bot_step
+            if total_collectible > 500:
+                break
 
-        already = state.ghost_spins_at.get(v, 0)
-        remaining_cap = max(0.0, 50 - already * est_value_per_spin)
-        est_coins = min(est_coins, remaining_cap)
+        # If bot won't visit, coins are stranded (unless bot threshold drops)
+        # Still value it for its α since bot might pass through on later DFS
+        if total_collectible <= 0:
+            # Small score based on α alone (bot may visit eventually)
+            total_collectible = min(50, remaining * mean_spin * 0.1)
 
-        total_time = max(1, ghost_travel + min(spins_available, int(50 / max(0.1, est_value_per_spin)) + 1))
-        score = est_coins / total_time
-
+        score = total_collectible / max(1, ghost_travel + 1)
         if score > best_score:
             best_score = score
             best_v = v
@@ -513,17 +542,17 @@ def SubmissionGhost(
     # === EXPLORE PHASE ===
     if state.phase == 'explore':
         if state.exploration_done:
-            # Pick the beacon slot and transition
             state.beacon_slot = _ghost_pick_beacon(state, pos, step, total_steps)
             if state.beacon_slot is not None:
                 state.phase = 'beacon'
                 state.target = state.beacon_slot
             else:
                 state.phase = 'farm'
+                state.target = None
 
         if state.phase == 'explore':
-            action = _ghost_explore_action(state, pos, neighbors)
-            if action is None:
+            # Force-finish exploration by step 150 to avoid wasting time
+            if step >= 150:
                 _finish_exploration(state, total_steps)
                 state.beacon_slot = _ghost_pick_beacon(state, pos, step, total_steps)
                 if state.beacon_slot is not None:
@@ -531,8 +560,20 @@ def SubmissionGhost(
                     state.target = state.beacon_slot
                 else:
                     state.phase = 'farm'
+                    state.target = None
             else:
-                return action, state
+                action = _ghost_explore_action(state, pos, neighbors)
+                if action is None:
+                    _finish_exploration(state, total_steps)
+                    state.beacon_slot = _ghost_pick_beacon(state, pos, step, total_steps)
+                    if state.beacon_slot is not None:
+                        state.phase = 'beacon'
+                        state.target = state.beacon_slot
+                    else:
+                        state.phase = 'farm'
+                        state.target = None
+                else:
+                    return action, state
 
     # === BEACON PHASE: travel to beacon slot, spin to fill it ===
     if state.phase == 'beacon':
@@ -565,37 +606,54 @@ def SubmissionGhost(
             state.phase = 'farm'
             state.target = None
 
-    # === FARM PHASE: farm secondary slots for bonus collection ===
+    # === FARM PHASE: go to best slot and spin permanently ===
     if state.phase == 'farm':
-        # If at a slot and target matches, spin for a while
-        if has_slot and pos == state.target:
-            state.ghost_spins_at[pos] = state.ghost_spins_at.get(pos, 0) + 1
-            spins = state.ghost_spins_at[pos]
-
-            # Don't spin at same slot as bot (wasted if both spin)
-            bot_here_now = state.bot_schedule and state.bot_schedule.get(step) == pos
-            if bot_here_now or (state.bot_settled and state.bot_settled_pos == pos):
-                state.target = None
-            elif spins <= 15:
-                return -1, state
-            else:
-                state.target = None
-
-        # Pick new farm target
-        if state.target is None or state.target == pos:
+        # Pick permanent farm slot once
+        if state.target is None:
             state.target = _ghost_pick_farm_target(state, pos, step, total_steps)
+            # Fallback: highest-α slot not occupied by bot
+            if state.target is None and state.slot_set and state.apsp_dist:
+                best_a = -1.0
+                for v in state.slot_set:
+                    if state.bot_settled and v == state.bot_settled_pos:
+                        continue
+                    a = _est_alpha(state, v)
+                    if a > best_a:
+                        best_a = a
+                        state.target = v
 
-        if state.target is not None and state.target != pos:
+        if state.target is not None and pos != state.target:
             nxt = _ghost_get_next_step(state, pos, state.target)
             if nxt != -1 and nxt in neighbors:
                 return nxt, state
+            # Can't navigate, try nearest slot
             state.target = None
 
-        # Fallback: at a slot, spin; otherwise move toward nearest slot
+        # At target (or any slot) — spin permanently
         if has_slot:
+            # Avoid spinning same step as bot (only one spin counts)
+            bot_here = (state.bot_schedule and
+                        state.bot_schedule.get(step) == pos)
+            if state.bot_settled and state.bot_settled_pos == pos:
+                # Bot parked here — this is wasted, find another slot
+                state.target = None
+                best_a = -1.0
+                for v in state.slot_set:
+                    if v == pos:
+                        continue
+                    if state.apsp_dist and state.apsp_dist[pos][v] < 9999:
+                        a = _est_alpha(state, v)
+                        if a > best_a:
+                            best_a = a
+                            state.target = v
+                if state.target is not None:
+                    nxt = _ghost_get_next_step(state, pos, state.target)
+                    if nxt != -1 and nxt in neighbors:
+                        return nxt, state
             state.ghost_spins_at[pos] = state.ghost_spins_at.get(pos, 0) + 1
             return -1, state
 
+        # Not at a slot — move toward nearest slot
         if state.apsp_dist:
             best_d = 9999
             best_s = -1
@@ -606,6 +664,7 @@ def SubmissionGhost(
                     best_d = state.apsp_dist[pos][s]
                     best_s = s
             if best_s >= 0:
+                state.target = best_s
                 nxt = _ghost_get_next_step(state, pos, best_s)
                 if nxt != -1 and nxt in neighbors:
                     return nxt, state
