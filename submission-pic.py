@@ -69,6 +69,55 @@ def _ensure_types():
         Message = _Msg
 
 
+def _make_msg(**kw):
+    """Safely construct a Message object."""
+    try:
+        return Message(**kw)
+    except Exception:
+        pass
+    # Fallback: plain object
+    class _M:
+        pass
+    m = _M()
+    m.__dict__.update(kw)
+    return m
+
+
+_req_kwarg_names = None  # cached kwarg names for request construction
+
+def _try_make_req(cls, a, b, c, d):
+    """Try to construct a request object with (a,b,c,d) using various approaches."""
+    global _req_kwarg_names
+    if _req_kwarg_names is not None:
+        try:
+            return cls(**{_req_kwarg_names[0]: a, _req_kwarg_names[1]: b,
+                          _req_kwarg_names[2]: c, _req_kwarg_names[3]: d})
+        except Exception:
+            pass
+    # Try positional first
+    try:
+        obj = cls(a, b, c, d)
+        return obj
+    except Exception:
+        pass
+    # Try keyword patterns
+    for names in [
+        ('r1', 'c1', 'r2', 'c2'),
+        ('row1', 'col1', 'row2', 'col2'),
+        ('top_row', 'left_col', 'bottom_row', 'right_col'),
+        ('top', 'left', 'bottom', 'right'),
+        ('start_row', 'start_col', 'end_row', 'end_col'),
+        ('min_row', 'min_col', 'max_row', 'max_col'),
+    ]:
+        try:
+            obj = cls(**{names[0]: a, names[1]: b, names[2]: c, names[3]: d})
+            _req_kwarg_names = names
+            return obj
+        except Exception:
+            pass
+    return None
+
+
 class SubmissionStrategy(Strategy):
 
     def __init__(self, corrupted):
@@ -134,27 +183,41 @@ class SubmissionStrategy(Strategy):
         BS = self.bs
         sm = sorted(self.missing)
 
-        for br, bc in sm:
-            r1, c1 = br * BS, bc * BS
-            reqs.append(RegionAverageRequest(r1, c1, r1 + 9, c1 + 9))
-            meta.append(("avg", br, bc))
+        def _avg(a, b, c, d):
+            obj = _try_make_req(RegionAverageRequest, a, b, c, d)
+            if obj is not None:
+                reqs.append(obj)
+                return True
+            return False
+
+        def _reg(a, b, c, d):
+            obj = _try_make_req(RegionRequest, a, b, c, d)
+            if obj is not None:
+                reqs.append(obj)
+                return True
+            return False
 
         for br, bc in sm:
             r1, c1 = br * BS, bc * BS
-            reqs.append(RegionRequest(r1 + 5, c1 + 5, r1 + 5, c1 + 5))
-            meta.append(("pix", br, bc, r1 + 5, c1 + 5))
+            if _avg(r1, c1, r1 + 9, c1 + 9):
+                meta.append(("avg", br, bc))
+
+        for br, bc in sm:
+            r1, c1 = br * BS, bc * BS
+            if _reg(r1 + 5, c1 + 5, r1 + 5, c1 + 5):
+                meta.append(("pix", br, bc, r1 + 5, c1 + 5))
 
         for br, bc in sm:
             r1, c1 = br * BS, bc * BS
             for dr, dc in [(2, 2), (2, 7), (7, 2), (7, 7)]:
-                reqs.append(RegionRequest(r1+dr, c1+dc, r1+dr, c1+dc))
-                meta.append(("pix", br, bc, r1+dr, c1+dc))
+                if _reg(r1+dr, c1+dc, r1+dr, c1+dc):
+                    meta.append(("pix", br, bc, r1+dr, c1+dc))
 
         for br, bc in sm:
             r1, c1 = br * BS, bc * BS
             for pr, pc in [(r1, c1+5), (r1+9, c1+5), (r1+5, c1), (r1+5, c1+9)]:
-                reqs.append(RegionRequest(pr, pc, pr, pc))
-                meta.append(("pix", br, bc, pr, pc))
+                if _reg(pr, pc, pr, pc):
+                    meta.append(("pix", br, bc, pr, pc))
 
         for br, bc in sm:
             r1, c1 = br * BS, bc * BS
@@ -162,14 +225,14 @@ class SubmissionStrategy(Strategy):
                 (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
                 (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9),
             ]:
-                reqs.append(RegionAverageRequest(qr1, qc1, qr2, qc2))
-                meta.append(("qavg", br, bc, qr1, qc1, qr2, qc2))
+                if _avg(qr1, qc1, qr2, qc2):
+                    meta.append(("qavg", br, bc, qr1, qc1, qr2, qc2))
 
         for br, bc in sm:
             r1, c1 = br * BS, bc * BS
             for dr, dc in [(1,5),(5,1),(5,8),(8,5),(3,3),(3,6),(6,3),(6,6)]:
-                reqs.append(RegionRequest(r1+dr, c1+dc, r1+dr, c1+dc))
-                meta.append(("pix", br, bc, r1+dr, c1+dc))
+                if _reg(r1+dr, c1+dc, r1+dr, c1+dc):
+                    meta.append(("pix", br, bc, r1+dr, c1+dc))
 
         self.req_meta = meta
         return reqs
@@ -520,42 +583,89 @@ class SubmissionStrategy(Strategy):
                     total += self.recv_avgs[nb]; cnt += 1
         return total / cnt if cnt > 0 else self.global_mean
 
+    @staticmethod
+    def _rect(req):
+        """Extract (r1,c1,r2,c2) from a request object regardless of attr names."""
+        # Try known naming conventions in order
+        for names in [
+            ('r1', 'c1', 'r2', 'c2'),
+            ('row1', 'col1', 'row2', 'col2'),
+            ('top_row', 'left_col', 'bottom_row', 'right_col'),
+            ('top', 'left', 'bottom', 'right'),
+            ('start_row', 'start_col', 'end_row', 'end_col'),
+            ('min_row', 'min_col', 'max_row', 'max_col'),
+            ('y1', 'x1', 'y2', 'x2'),
+            ('x1', 'y1', 'x2', 'y2'),
+        ]:
+            vals = [getattr(req, n, None) for n in names]
+            if all(v is not None for v in vals):
+                return tuple(int(v) for v in vals)
+        # Fallback: grab all int attributes sorted by name
+        d = {}
+        for attr in dir(req):
+            if attr.startswith('_'):
+                continue
+            v = getattr(req, attr, None)
+            if isinstance(v, (int, float)) and not callable(v):
+                d[attr] = v
+        if len(d) >= 4:
+            keys = sorted(d.keys())
+            return tuple(int(d[k]) for k in keys[:4])
+        # Last resort: try __dict__
+        if hasattr(req, '__dict__'):
+            vals = [v for v in req.__dict__.values() if isinstance(v, (int, float))]
+            if len(vals) >= 4:
+                return tuple(int(v) for v in vals[:4])
+        return None
+
     def _respond(self, req):
-        if RegionAverageRequest is not None and isinstance(req, RegionAverageRequest):
-            return self._resp_avg(req)
-        if RegionRequest is not None and isinstance(req, RegionRequest):
-            return self._resp_region(req)
-        if SplitRequest is not None and isinstance(req, SplitRequest):
-            return self._resp_split(req)
-        cls_name = type(req).__name__
-        if 'Average' in cls_name:
-            return self._resp_avg(req)
-        if 'Split' in cls_name:
-            return self._resp_split(req)
-        if 'Region' in cls_name:
-            return self._resp_region(req)
-        if hasattr(req, 'r1') and hasattr(req, 'c1'):
-            return self._resp_region(req)
+        try:
+            if RegionAverageRequest is not None and isinstance(req, RegionAverageRequest):
+                return self._resp_avg(req)
+            if RegionRequest is not None and isinstance(req, RegionRequest):
+                return self._resp_region(req)
+            if SplitRequest is not None and isinstance(req, SplitRequest):
+                return self._resp_split(req)
+            cls_name = type(req).__name__
+            if 'Average' in cls_name:
+                return self._resp_avg(req)
+            if 'Split' in cls_name:
+                return self._resp_split(req)
+            if 'Region' in cls_name:
+                return self._resp_region(req)
+            rect = self._rect(req)
+            if rect is not None:
+                return self._resp_region(req)
+        except Exception:
+            pass
         return None
 
     def _resp_avg(self, req):
+        rect = self._rect(req)
+        if rect is None:
+            return None
+        rr1, cc1, rr2, cc2 = rect
         total, cnt = 0.0, 0
-        for r in range(max(0, req.r1), min(self.n, req.r2 + 1)):
-            for c in range(max(0, req.c1), min(self.n, req.c2 + 1)):
+        for r in range(max(0, rr1), min(self.n, rr2 + 1)):
+            for c in range(max(0, cc1), min(self.n, cc2 + 1)):
                 v = self.corrupted[r][c]
                 if v is not None:
                     total += v; cnt += 1
         if cnt == 0:
             return None
-        return Message(value=total / cnt)
+        return _make_msg(value=total / cnt)
 
     def _resp_region(self, req):
-        cr = (req.r1 + req.r2) * 0.5
-        cc = (req.c1 + req.c2) * 0.5
+        rect = self._rect(req)
+        if rect is None:
+            return None
+        rr1, cc1, rr2, cc2 = rect
+        cr = (rr1 + rr2) * 0.5
+        cc = (cc1 + cc2) * 0.5
         best = None
         best_d = 1e18
-        for r in range(max(0, req.r1), min(self.n, req.r2 + 1)):
-            for c in range(max(0, req.c1), min(self.n, req.c2 + 1)):
+        for r in range(max(0, rr1), min(self.n, rr2 + 1)):
+            for c in range(max(0, cc1), min(self.n, cc2 + 1)):
                 v = self.corrupted[r][c]
                 if v is not None:
                     d = (r - cr) * (r - cr) + (c - cc) * (c - cc)
@@ -564,14 +674,18 @@ class SubmissionStrategy(Strategy):
                         best_d = d
         if best is None:
             return None
-        return Message(row=best[0], col=best[1], value=best[2])
+        return _make_msg(row=best[0], col=best[1], value=best[2])
 
     def _resp_split(self, req):
-        v1 = self.corrupted[req.r1][req.c1] if 0 <= req.r1 < self.n and 0 <= req.c1 < self.n else None
-        v2 = self.corrupted[req.r2][req.c2] if 0 <= req.r2 < self.n and 0 <= req.c2 < self.n else None
+        rect = self._rect(req)
+        if rect is None:
+            return None
+        rr1, cc1, rr2, cc2 = rect
+        v1 = self.corrupted[rr1][cc1] if 0 <= rr1 < self.n and 0 <= cc1 < self.n else None
+        v2 = self.corrupted[rr2][cc2] if 0 <= rr2 < self.n and 0 <= cc2 < self.n else None
         if v1 is None or v2 is None:
             return None
-        return Message(value=1.0 if abs(v1 - v2) > 0.15 else 0.0)
+        return _make_msg(value=1.0 if abs(v1 - v2) > 0.15 else 0.0)
 
     @staticmethod
     def _extract_value(msg):
