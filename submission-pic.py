@@ -1,8 +1,7 @@
-"""CMIMC PIC - Image Recovery Strategy"""
+"""CMIMC PIC - Lean recovery (no SOR, fast, diagnostic)"""
 import sys
 import time
 
-# --- Import Strategy at module level (needed for class definition) ---
 Strategy = None
 for _mn in ['strategy', 'game', 'game_types']:
     try:
@@ -21,7 +20,7 @@ if Strategy is None:
         def __init__(self, corrupted):
             pass
 
-# --- Lazy-resolved types (defined by server AFTER importing us) ---
+# Lazy-resolved types
 RegionRequest = None
 RegionAverageRequest = None
 SplitRequest = None
@@ -30,7 +29,6 @@ _types_resolved = False
 
 
 def _lookup(name):
-    """Find a name in __main__ or known modules."""
     _main = sys.modules.get('__main__')
     if _main:
         val = getattr(_main, name, None)
@@ -42,14 +40,6 @@ def _lookup(name):
             val = getattr(_m, name, None)
             if val is not None:
                 return val
-        else:
-            try:
-                _m = __import__(_mn)
-                val = getattr(_m, name, None)
-                if val is not None:
-                    return val
-            except Exception:
-                pass
     return None
 
 
@@ -69,13 +59,54 @@ def _ensure_types():
         Message = _Msg
 
 
+def _get_rect(req):
+    """Extract (r1,c1,r2,c2) from a request."""
+    # dataclass fields
+    try:
+        dcf = getattr(type(req), '__dataclass_fields__', None)
+        if dcf:
+            keys = list(dcf.keys())
+            if len(keys) >= 4:
+                return tuple(int(getattr(req, keys[i])) for i in range(4))
+    except Exception:
+        pass
+    # NamedTuple
+    try:
+        nf = getattr(type(req), '_fields', None)
+        if nf and len(nf) >= 4:
+            return tuple(int(getattr(req, nf[i])) for i in range(4))
+    except Exception:
+        pass
+    # __init__ code varnames
+    try:
+        code = type(req).__init__.__code__
+        names = code.co_varnames[1:code.co_argcount]
+        if len(names) >= 4:
+            return tuple(int(getattr(req, names[i])) for i in range(4))
+    except Exception:
+        pass
+    # __dict__ ordered values
+    try:
+        d = req.__dict__
+        vals = [v for k, v in d.items() if not k.startswith('_') and isinstance(v, (int, float))]
+        if len(vals) >= 4:
+            return tuple(int(v) for v in vals[:4])
+    except Exception:
+        pass
+    # Index access (tuple-like)
+    try:
+        if len(req) >= 4:
+            return tuple(int(req[i]) for i in range(4))
+    except Exception:
+        pass
+    return None
+
+
 def _make_msg(**kw):
-    """Safely construct a Message object."""
     try:
         return Message(**kw)
     except Exception:
         pass
-    # Fallback: plain object
     class _M:
         pass
     m = _M()
@@ -83,113 +114,63 @@ def _make_msg(**kw):
     return m
 
 
-# --- Class field introspection (no imports, lightweight) ---
-_field_cache = {}  # cls -> tuple of field names
-
-
-def _get_fields(cls):
-    """Discover field names without importing inspect/dataclasses."""
-    if cls in _field_cache:
-        return _field_cache[cls]
-    names = None
-    # 1. dataclass: __dataclass_fields__ is an OrderedDict set by @dataclass
+def _extract_value(msg):
+    if msg is None:
+        return None
+    if isinstance(msg, (int, float)):
+        return float(msg)
+    for attr in ("value", "mean", "average", "val"):
+        v = getattr(msg, attr, None)
+        if v is not None:
+            return float(v)
+    # introspect fields
     try:
-        dcf = getattr(cls, '__dataclass_fields__', None)
+        dcf = getattr(type(msg), '__dataclass_fields__', None)
         if dcf:
-            names = tuple(dcf.keys())
+            for fn in dcf:
+                v = getattr(msg, fn, None)
+                if isinstance(v, (int, float)):
+                    return float(v)
     except Exception:
         pass
-    # 2. NamedTuple: has _fields attribute
-    if names is None:
-        try:
-            nf = getattr(cls, '_fields', None)
-            if nf and isinstance(nf, tuple) and all(isinstance(f, str) for f in nf):
-                names = nf
-        except Exception:
-            pass
-    # 3. __init__ code object (works for any class with a standard __init__)
-    if names is None:
-        try:
-            code = cls.__init__.__code__
-            names = tuple(code.co_varnames[1:code.co_argcount])
-        except (AttributeError, TypeError):
-            pass
-    # 4. class __annotations__
-    if names is None:
-        try:
-            ann = getattr(cls, '__annotations__', None)
-            if ann and isinstance(ann, dict) and len(ann) >= 4:
-                names = tuple(ann.keys())
-        except Exception:
-            pass
-    # 5. __slots__
-    if names is None:
-        try:
-            slots = getattr(cls, '__slots__', None)
-            if slots:
-                names = tuple(s for s in slots if not s.startswith('_'))
-        except Exception:
-            pass
-    _field_cache[cls] = names
-    return names
-
-
-def _make_req(cls, a, b, c, d):
-    """Construct a request with 4 positional values."""
-    # Positional first — works for most types including NamedTuples
     try:
-        return cls(a, b, c, d)
+        code = type(msg).__init__.__code__
+        for fn in code.co_varnames[1:code.co_argcount]:
+            v = getattr(msg, fn, None)
+            if isinstance(v, (int, float)):
+                return float(v)
     except Exception:
         pass
-    # Kwargs using discovered field names
-    fields = _get_fields(cls)
-    if fields and len(fields) >= 4:
-        try:
-            return cls(**{fields[0]: a, fields[1]: b, fields[2]: c, fields[3]: d})
-        except Exception:
-            pass
     return None
 
 
-def _get_rect(req):
-    """Extract (r1,c1,r2,c2) from a request object."""
-    cls = type(req)
-    # 1. Try introspected field names
-    fields = _get_fields(cls)
-    if fields and len(fields) >= 4:
-        try:
-            return tuple(int(getattr(req, fields[i])) for i in range(4))
-        except Exception:
-            pass
-    # 2. Try __dict__ ordered values (Python 3.7+ preserves insertion order)
+def _extract_row_col(msg):
+    """Extract (row, col) from a Message."""
+    row = getattr(msg, 'row', None)
+    col = getattr(msg, 'col', None)
+    if row is not None and col is not None:
+        return (row, col)
+    # Try introspecting
     try:
-        d = getattr(req, '__dict__', None)
-        if d:
-            vals = [v for k, v in d.items()
-                    if not k.startswith('_') and isinstance(v, (int, float))]
-            if len(vals) >= 4:
-                return tuple(int(v) for v in vals[:4])
+        dcf = getattr(type(msg), '__dataclass_fields__', None)
+        if dcf:
+            keys = list(dcf.keys())
+            # Typically: value, row, col
+            if len(keys) >= 3:
+                row = getattr(msg, keys[1], None)
+                col = getattr(msg, keys[2], None)
+                if row is not None and col is not None:
+                    return (row, col)
     except Exception:
         pass
-    # 3. Try __slots__
     try:
-        slots = getattr(cls, '__slots__', None)
-        if slots:
-            vals = []
-            for s in slots:
-                if s.startswith('_'):
-                    continue
-                v = getattr(req, s, None)
-                if isinstance(v, (int, float)):
-                    vals.append(int(v))
-            if len(vals) >= 4:
-                return tuple(vals[:4])
-    except Exception:
-        pass
-    # 4. Try index access (NamedTuple / tuple-like)
-    try:
-        if hasattr(req, '__getitem__') and hasattr(req, '__len__') and len(req) >= 4:
-            return tuple(int(req[i]) for i in range(4))
+        code = type(msg).__init__.__code__
+        names = code.co_varnames[1:code.co_argcount]
+        if len(names) >= 3:
+            row = getattr(msg, names[1], None)
+            col = getattr(msg, names[2], None)
+            if row is not None and col is not None:
+                return (row, col)
     except Exception:
         pass
     return None
@@ -198,8 +179,6 @@ def _get_rect(req):
 class SubmissionStrategy(Strategy):
 
     def __init__(self, corrupted):
-        self._t0 = time.time()
-        self._init_ok = False
         self.n = 50
         self.bs = 10
         self.corrupted = corrupted
@@ -209,129 +188,96 @@ class SubmissionStrategy(Strategy):
         self.recv_quad_avgs = {}
         self.global_mean = 0.5
         self.is_binary = False
-        self.image = [[0.5] * 50 for _ in range(50)]
-        self.mask = [[False] * 50 for _ in range(50)]
         self.visible = set()
         self.missing = set()
         self.vis_means = {}
+        self.image = None
+        self.mask = None
         try:
             super().__init__(corrupted)
-            self._do_init(corrupted)
-        except BaseException:
+        except Exception:
+            pass
+        try:
+            self._do_init()
+        except Exception:
             pass
 
-    def _do_init(self, corrupted):
-        N = 50
-        BS = 10
-
-        img = [[0.0] * N for _ in range(N)]
-        mask = [[False] * N for _ in range(N)]
+    def _do_init(self):
+        N = self.n
+        BS = self.bs
+        corrupted = self.corrupted
+        img = [[0.0]*N for _ in range(N)]
+        mask = [[False]*N for _ in range(N)]
         for r in range(N):
-            row = corrupted[r]
             for c in range(N):
-                v = row[c]
+                v = corrupted[r][c]
                 if v is not None:
-                    img[r][c] = v
+                    img[r][c] = float(v)
                     mask[r][c] = True
         self.image = img
         self.mask = mask
-
-        visible = set()
-        missing = set()
         for br in range(5):
             for bc in range(5):
-                if mask[br * BS][bc * BS]:
-                    visible.add((br, bc))
+                if mask[br*BS][bc*BS]:
+                    self.visible.add((br, bc))
                 else:
-                    missing.add((br, bc))
-        self.visible = visible
-        self.missing = missing
-
-        vis_means = {}
+                    self.missing.add((br, bc))
         all_vals = []
-        for br, bc in visible:
+        for br, bc in self.visible:
             s = 0.0
-            for r in range(br * BS, br * BS + BS):
-                for c in range(bc * BS, bc * BS + BS):
+            for r in range(br*BS, br*BS+BS):
+                for c in range(bc*BS, bc*BS+BS):
                     s += img[r][c]
-            vis_means[(br, bc)] = s / (BS * BS)
-            for r in range(br * BS, br * BS + BS):
-                for c in range(bc * BS, bc * BS + BS):
+            self.vis_means[(br,bc)] = s / (BS*BS)
+            for r in range(br*BS, br*BS+BS):
+                for c in range(bc*BS, bc*BS+BS):
                     all_vals.append(img[r][c])
-        self.vis_means = vis_means
-
-        self.global_mean = sum(all_vals) / len(all_vals) if all_vals else 0.5
-        self.is_binary = self._detect_binary(all_vals)
-        self._init_ok = True
+        self.global_mean = sum(all_vals)/len(all_vals) if all_vals else 0.5
+        near_0 = sum(1 for v in all_vals if v < 0.3)
+        near_1 = sum(1 for v in all_vals if v > 0.7)
+        mid = sum(1 for v in all_vals if 0.35 <= v <= 0.65)
+        if len(all_vals) >= 100:
+            self.is_binary = (near_0+near_1)/len(all_vals) > 0.6 and mid/len(all_vals) < 0.25
 
     def make_requests(self):
         try:
             return self._do_make_requests()
-        except BaseException:
+        except Exception:
             return []
 
     def _do_make_requests(self):
-        if not self._init_ok:
-            return []
         _ensure_types()
         if RegionAverageRequest is None or RegionRequest is None:
             return []
         reqs = []
         meta = []
         BS = self.bs
-        sm = sorted(self.missing)
-
-        def _avg(a, b, c, d):
-            obj = _make_req(RegionAverageRequest, a, b, c, d)
-            if obj is not None:
-                reqs.append(obj)
-                return True
-            return False
-
-        def _reg(a, b, c, d):
-            obj = _make_req(RegionRequest, a, b, c, d)
-            if obj is not None:
-                reqs.append(obj)
-                return True
-            return False
-
-        for br, bc in sm:
-            r1, c1 = br * BS, bc * BS
-            if _avg(r1, c1, r1 + 9, c1 + 9):
+        for br, bc in sorted(self.missing):
+            r1, c1 = br*BS, bc*BS
+            try:
+                reqs.append(RegionAverageRequest(r1, c1, r1+9, c1+9))
                 meta.append(("avg", br, bc))
-
-        for br, bc in sm:
-            r1, c1 = br * BS, bc * BS
-            if _reg(r1 + 5, c1 + 5, r1 + 5, c1 + 5):
-                meta.append(("pix", br, bc, r1 + 5, c1 + 5))
-
-        for br, bc in sm:
-            r1, c1 = br * BS, bc * BS
-            for dr, dc in [(2, 2), (2, 7), (7, 2), (7, 7)]:
-                if _reg(r1+dr, c1+dc, r1+dr, c1+dc):
+            except Exception:
+                pass
+        for br, bc in sorted(self.missing):
+            r1, c1 = br*BS, bc*BS
+            for dr, dc in [(5,5),(2,2),(2,7),(7,2),(7,7),(0,5),(9,5),(5,0),(5,9),
+                            (1,5),(5,1),(5,8),(8,5),(3,3),(3,6),(6,3),(6,6)]:
+                try:
+                    reqs.append(RegionRequest(r1+dr, c1+dc, r1+dr, c1+dc))
                     meta.append(("pix", br, bc, r1+dr, c1+dc))
-
-        for br, bc in sm:
-            r1, c1 = br * BS, bc * BS
-            for pr, pc in [(r1, c1+5), (r1+9, c1+5), (r1+5, c1), (r1+5, c1+9)]:
-                if _reg(pr, pc, pr, pc):
-                    meta.append(("pix", br, bc, pr, pc))
-
-        for br, bc in sm:
-            r1, c1 = br * BS, bc * BS
+                except Exception:
+                    pass
+        for br, bc in sorted(self.missing):
+            r1, c1 = br*BS, bc*BS
             for qr1, qc1, qr2, qc2 in [
                 (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
-                (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9),
-            ]:
-                if _avg(qr1, qc1, qr2, qc2):
+                (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9)]:
+                try:
+                    reqs.append(RegionAverageRequest(qr1, qc1, qr2, qc2))
                     meta.append(("qavg", br, bc, qr1, qc1, qr2, qc2))
-
-        for br, bc in sm:
-            r1, c1 = br * BS, bc * BS
-            for dr, dc in [(1,5),(5,1),(5,8),(8,5),(3,3),(3,6),(6,3),(6,6)]:
-                if _reg(r1+dr, c1+dc, r1+dr, c1+dc):
-                    meta.append(("pix", br, bc, r1+dr, c1+dc))
-
+                except Exception:
+                    pass
         self.req_meta = meta
         return reqs
 
@@ -349,85 +295,103 @@ class SubmissionStrategy(Strategy):
                 if resp is not None:
                     answered += 1
             return responses
-        except BaseException:
+        except Exception:
             return [None] * len(requests)
+
+    def _respond(self, req):
+        try:
+            rect = _get_rect(req)
+            if rect is None:
+                return None
+            rr1, cc1, rr2, cc2 = rect
+            cls_name = type(req).__name__
+            if 'Average' in cls_name:
+                total, cnt = 0.0, 0
+                for r in range(max(0,rr1), min(self.n,rr2+1)):
+                    for c in range(max(0,cc1), min(self.n,cc2+1)):
+                        v = self.corrupted[r][c]
+                        if v is not None:
+                            total += v; cnt += 1
+                if cnt == 0:
+                    return None
+                return _make_msg(value=total/cnt)
+            elif 'Split' in cls_name:
+                v1 = self.corrupted[rr1][cc1] if 0<=rr1<self.n and 0<=cc1<self.n else None
+                v2 = self.corrupted[rr2][cc2] if 0<=rr2<self.n and 0<=cc2<self.n else None
+                if v1 is None or v2 is None:
+                    return None
+                return _make_msg(value=1.0 if abs(v1-v2) > 0.15 else 0.0)
+            else:
+                # Region request - return one pixel
+                best = None
+                best_d = 1e18
+                cr = (rr1+rr2)*0.5
+                cc_mid = (cc1+cc2)*0.5
+                for r in range(max(0,rr1), min(self.n,rr2+1)):
+                    for c in range(max(0,cc1), min(self.n,cc2+1)):
+                        v = self.corrupted[r][c]
+                        if v is not None:
+                            d = (r-cr)**2 + (c-cc_mid)**2
+                            if d < best_d:
+                                best = (r, c, v)
+                                best_d = d
+                if best is None:
+                    return None
+                return _make_msg(row=best[0], col=best[1], value=best[2])
+        except Exception:
+            return None
 
     def receive_messages(self, messages):
         try:
-            self._do_receive_messages(messages)
-        except BaseException:
+            for i, msg in enumerate(messages):
+                if msg is None or i >= len(self.req_meta):
+                    continue
+                m = self.req_meta[i]
+                val = _extract_value(msg)
+                if val is None:
+                    continue
+                val = max(0.0, min(1.0, val))
+                if m[0] == "avg":
+                    self.recv_avgs[(m[1], m[2])] = val
+                elif m[0] == "qavg":
+                    self.recv_quad_avgs[(m[3], m[4], m[5], m[6])] = val
+                elif m[0] == "pix":
+                    rc = _extract_row_col(msg)
+                    if rc is not None:
+                        self.recv_pixels[rc] = val
+                    else:
+                        self.recv_pixels[(m[3], m[4])] = val
+        except Exception:
             pass
-
-    def _do_receive_messages(self, messages):
-        msg_fields = None
-        for i, msg in enumerate(messages):
-            if msg is None or i >= len(self.req_meta):
-                continue
-            m = self.req_meta[i]
-            val = self._extract_value(msg)
-            if val is None:
-                continue
-            val = max(0.0, min(1.0, val))
-
-            if m[0] == "avg":
-                self.recv_avgs[(m[1], m[2])] = val
-            elif m[0] == "qavg":
-                self.recv_quad_avgs[(m[3], m[4], m[5], m[6])] = val
-            elif m[0] == "pix":
-                row = None
-                col = None
-                if msg_fields is None:
-                    msg_fields = _get_fields(type(msg))
-                if msg_fields:
-                    for fn in msg_fields:
-                        v = getattr(msg, fn, None)
-                        if v is None:
-                            continue
-                        fl = fn.lower()
-                        if row is None and ('row' in fl or fl == 'r' or fl == 'y'):
-                            row = v
-                        elif col is None and ('col' in fl or fl == 'c' or fl == 'x'):
-                            col = v
-                if row is None:
-                    row = getattr(msg, 'row', None)
-                if col is None:
-                    col = getattr(msg, 'col', None)
-                if row is not None and col is not None:
-                    self.recv_pixels[(row, col)] = val
-                else:
-                    self.recv_pixels[(m[3], m[4])] = val
 
     def recover(self):
         try:
             return self._do_recover()
-        except BaseException:
+        except Exception:
             pass
-        # Fallback: return corrupted image with 0.5 for missing
         try:
-            N = self.n
-            result = []
-            for r in range(N):
-                row = []
-                for c in range(N):
-                    v = self.corrupted[r][c]
-                    row.append(v if v is not None else 0.5)
-                result.append(row)
-            return result
-        except BaseException:
-            return [[0.5] * 50 for _ in range(50)]
+            return [[float(self.corrupted[r][c]) if self.corrupted[r][c] is not None else 0.5
+                      for c in range(self.n)] for r in range(self.n)]
+        except Exception:
+            return [[0.5]*50 for _ in range(50)]
 
     def _do_recover(self):
         N = self.n
         BS = self.bs
         img = self.image
         mask = self.mask
+        if img is None:
+            return [[float(self.corrupted[r][c]) if self.corrupted[r][c] is not None else 0.5
+                      for c in range(N)] for r in range(N)]
 
+        # Snap binary values
         if self.is_binary:
             for r in range(N):
                 for c in range(N):
                     if mask[r][c]:
                         img[r][c] = 1.0 if img[r][c] >= 0.5 else 0.0
 
+        # Apply received pixels
         for (r, c), v in self.recv_pixels.items():
             if 0 <= r < N and 0 <= c < N:
                 if self.is_binary:
@@ -435,270 +399,120 @@ class SubmissionStrategy(Strategy):
                 img[r][c] = v
                 mask[r][c] = True
 
-        if self.is_binary:
-            self._recover_binary(img, mask)
-        else:
-            self._recover_continuous(img, mask)
-
-        for r in range(N):
-            for c in range(N):
-                v = img[r][c]
-                if v is None or v != v:  # v != v catches NaN
-                    img[r][c] = self.global_mean
-                elif v < 0.0:
-                    img[r][c] = 0.0
-                elif v > 1.0:
-                    img[r][c] = 1.0
-                else:
-                    img[r][c] = float(v)
-
-        return img
-
-    def _recover_binary(self, img, mask):
-        N = self.n
-        BS = self.bs
-
+        # Fill missing blocks
         for br, bc in self.missing:
-            r1, c1 = br * BS, bc * BS
-            block_avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
+            r1, c1 = br*BS, bc*BS
+            block_avg = self.recv_avgs.get((br,bc), self._neighbor_avg(br,bc))
 
+            # Gather reference pixels from visible neighbors
             refs = []
-            if br > 0 and (br - 1, bc) in self.visible:
-                for c in range(c1, c1 + BS):
-                    refs.append((r1 - 1, c, img[r1 - 1][c]))
-            if br < 4 and (br + 1, bc) in self.visible:
-                for c in range(c1, c1 + BS):
-                    refs.append((r1 + BS, c, img[r1 + BS][c]))
-            if bc > 0 and (br, bc - 1) in self.visible:
-                for r in range(r1, r1 + BS):
-                    refs.append((r, c1 - 1, img[r][c1 - 1]))
-            if bc < 4 and (br, bc + 1) in self.visible:
-                for r in range(r1, r1 + BS):
-                    refs.append((r, c1 + BS, img[r][c1 + BS]))
+            for dbr, dbc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nbr, nbc = br+dbr, bc+dbc
+                if (nbr,nbc) in self.visible:
+                    if dbr == -1:
+                        for c in range(c1, c1+BS):
+                            refs.append((r1-1, c, img[r1-1][c]))
+                    elif dbr == 1:
+                        for c in range(c1, c1+BS):
+                            refs.append((r1+BS, c, img[r1+BS][c]))
+                    elif dbc == -1:
+                        for r in range(r1, r1+BS):
+                            refs.append((r, c1-1, img[r][c1-1]))
+                    elif dbc == 1:
+                        for r in range(r1, r1+BS):
+                            refs.append((r, c1+BS, img[r][c1+BS]))
+            # Add known pixels in this block
+            for (pr,pc), pv in self.recv_pixels.items():
+                if r1 <= pr < r1+BS and c1 <= pc < c1+BS:
+                    refs.append((pr, pc, pv))
 
-            for dbr, dbc in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
-                nbr, nbc = br + dbr, bc + dbc
-                if (nbr, nbc) in self.visible:
-                    cr = r1 + (BS if dbr == 1 else -1)
-                    cc = c1 + (BS if dbc == 1 else -1)
-                    if 0 <= cr < N and 0 <= cc < N:
-                        refs.append((cr, cc, img[cr][cc]))
-
-            for (pr, pc), pv in self.recv_pixels.items():
-                if r1 <= pr < r1 + BS and c1 <= pc < c1 + BS:
-                    refs.append((pr, pc, img[pr][pc]))
-
-            for r in range(r1, r1 + BS):
-                for c in range(c1, c1 + BS):
-                    if mask[r][c]:
-                        continue
-                    if refs:
-                        total_w, total_v = 0.0, 0.0
-                        for rr, rc, rv in refs:
-                            d2 = (r - rr) * (r - rr) + (c - rc) * (c - rc)
-                            if d2 == 0:
-                                total_w = 1.0; total_v = rv; break
-                            w = 1.0 / d2
-                            total_w += w; total_v += w * rv
-                        img[r][c] = total_v / total_w if total_w > 0 else block_avg
-                    else:
-                        img[r][c] = block_avg
-
-        non_fixed = []
-        for r in range(N):
-            for c in range(N):
-                if not mask[r][c]:
-                    non_fixed.append((r, c))
-
-        omega = 1.75
-        for _it in range(80):
-            if time.time() - self._t0 > 0.5:
-                break
-            max_change = 0.0
-            for r, c in non_fixed:
-                total = 0.0; cnt = 0
-                if r > 0:     total += img[r-1][c]; cnt += 1
-                if r < N-1:   total += img[r+1][c]; cnt += 1
-                if c > 0:     total += img[r][c-1]; cnt += 1
-                if c < N-1:   total += img[r][c+1]; cnt += 1
-                if cnt > 0:
-                    old = img[r][c]
-                    img[r][c] = old + omega * (total / cnt - old)
-                    d = abs(img[r][c] - old)
-                    if d > max_change: max_change = d
-            if max_change < 1e-5:
-                break
-
-        for br, bc in self.missing:
-            avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
-            r1, c1 = br * BS, bc * BS
-            pixels = []
-            for r in range(r1, r1 + BS):
-                for c in range(c1, c1 + BS):
-                    pixels.append((img[r][c], r, c))
-            count_1 = max(0, min(100, round(avg * 100)))
-            pixels.sort(key=lambda x: -x[0])
-            for i, (_, r, c) in enumerate(pixels):
-                img[r][c] = 1.0 if i < count_1 else 0.0
-
-    def _recover_continuous(self, img, mask):
-        N = self.n
-        BS = self.bs
-        quad_avgs = self.recv_quad_avgs
-
-        uniform_blocks = set()
-        for br, bc in self.missing:
-            avg = self.recv_avgs.get((br, bc))
-            if avg is None:
-                continue
-            r1, c1 = br * BS, bc * BS
-            block_pix = []
-            for (pr, pc), pv in self.recv_pixels.items():
-                if r1 <= pr < r1 + BS and c1 <= pc < c1 + BS:
-                    block_pix.append(pv)
-            if len(block_pix) >= 2:
-                if max(abs(p - avg) for p in block_pix) < 0.08:
-                    uniform_blocks.add((br, bc))
-                    for r in range(r1, r1 + BS):
-                        for c in range(c1, c1 + BS):
-                            if not mask[r][c]:
-                                img[r][c] = avg
-                                mask[r][c] = True
-
-        for br, bc in self.missing:
-            if (br, bc) in uniform_blocks:
-                continue
-            r1, c1 = br * BS, bc * BS
-            block_avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
-
-            refs = []
-            if br > 0 and (br - 1, bc) in self.visible:
-                for c in range(c1, c1 + BS):
-                    refs.append((r1 - 1, c, img[r1 - 1][c]))
-            if br < 4 and (br + 1, bc) in self.visible:
-                for c in range(c1, c1 + BS):
-                    refs.append((r1 + BS, c, img[r1 + BS][c]))
-            if bc > 0 and (br, bc - 1) in self.visible:
-                for r in range(r1, r1 + BS):
-                    refs.append((r, c1 - 1, img[r][c1 - 1]))
-            if bc < 4 and (br, bc + 1) in self.visible:
-                for r in range(r1, r1 + BS):
-                    refs.append((r, c1 + BS, img[r][c1 + BS]))
-
-            for dbr, dbc in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
-                nbr, nbc = br + dbr, bc + dbc
-                if (nbr, nbc) in self.visible:
-                    cr = r1 + (BS if dbr == 1 else -1)
-                    cc = c1 + (BS if dbc == 1 else -1)
-                    if 0 <= cr < N and 0 <= cc < N:
-                        refs.append((cr, cc, img[cr][cc]))
-
-            for (pr, pc), pv in self.recv_pixels.items():
-                if r1 <= pr < r1 + BS and c1 <= pc < c1 + BS:
-                    refs.append((pr, pc, img[pr][pc]))
-
+            # Quad averages
             quads = [
                 (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
-                (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9),
-            ]
-            q_info = {q: quad_avgs[q] for q in quads if q in quad_avgs}
+                (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9)]
+            q_info = {q: self.recv_quad_avgs[q] for q in quads if q in self.recv_quad_avgs}
 
-            for r in range(r1, r1 + BS):
-                for c in range(c1, c1 + BS):
+            for r in range(r1, r1+BS):
+                for c in range(c1, c1+BS):
                     if mask[r][c]:
                         continue
                     q_val = None
-                    for qr1, qc1, qr2, qc2 in quads:
-                        if qr1 <= r <= qr2 and qc1 <= c <= qc2:
-                            if (qr1, qc1, qr2, qc2) in q_info:
-                                q_val = q_info[(qr1, qc1, qr2, qc2)]
+                    for qr1,qc1,qr2,qc2 in quads:
+                        if qr1 <= r <= qr2 and qc1 <= c <= qc2 and (qr1,qc1,qr2,qc2) in q_info:
+                            q_val = q_info[(qr1,qc1,qr2,qc2)]
                             break
-
                     if refs:
-                        total_w, total_v = 0.0, 0.0
+                        tw, tv = 0.0, 0.0
                         for rr, rc, rv in refs:
-                            d2 = (r - rr) * (r - rr) + (c - rc) * (c - rc)
+                            d2 = (r-rr)**2 + (c-rc)**2
                             if d2 == 0:
-                                total_w = 1.0; total_v = rv; break
-                            w = 1.0 / d2
-                            total_w += w; total_v += w * rv
-                        idw = total_v / total_w if total_w > 0 else block_avg
-                        img[r][c] = 0.5 * idw + 0.5 * q_val if q_val is not None else idw
+                                tw = 1.0; tv = rv; break
+                            w = 1.0/d2
+                            tw += w; tv += w*rv
+                        idw = tv/tw if tw > 0 else block_avg
+                        img[r][c] = 0.5*idw + 0.5*q_val if q_val is not None else idw
                     elif q_val is not None:
                         img[r][c] = q_val
                     else:
                         img[r][c] = block_avg
 
-        fixed = [[False] * N for _ in range(N)]
-        non_fixed = []
+        # Binary: threshold
+        if self.is_binary:
+            for br, bc in self.missing:
+                r1, c1 = br*BS, bc*BS
+                avg = self.recv_avgs.get((br,bc), self._neighbor_avg(br,bc))
+                pixels = []
+                for r in range(r1, r1+BS):
+                    for c in range(c1, c1+BS):
+                        pixels.append((img[r][c], r, c))
+                count_1 = max(0, min(100, round(avg * 100)))
+                pixels.sort(key=lambda x: -x[0])
+                for i, (_, r, c) in enumerate(pixels):
+                    img[r][c] = 1.0 if i < count_1 else 0.0
+        else:
+            # Shift blocks to match averages
+            for br, bc in self.missing:
+                avg = self.recv_avgs.get((br,bc))
+                if avg is None:
+                    continue
+                r1, c1 = br*BS, bc*BS
+                # Shift quadrants
+                for qr1,qc1,qr2,qc2 in [
+                    (r1,c1,r1+4,c1+4),(r1,c1+5,r1+4,c1+9),
+                    (r1+5,c1,r1+9,c1+4),(r1+5,c1+5,r1+9,c1+9)]:
+                    key = (qr1,qc1,qr2,qc2)
+                    if key in self.recv_quad_avgs:
+                        q_sum, q_cnt = 0.0, 0
+                        for r in range(qr1, qr2+1):
+                            for c in range(qc1, qc2+1):
+                                q_sum += img[r][c]; q_cnt += 1
+                        if q_cnt > 0:
+                            shift = self.recv_quad_avgs[key] - q_sum/q_cnt
+                            for r in range(qr1, qr2+1):
+                                for c in range(qc1, qc2+1):
+                                    if not mask[r][c]:
+                                        img[r][c] = max(0.0, min(1.0, img[r][c]+shift))
+                # Shift whole block
+                b_sum = sum(img[r][c] for r in range(r1,r1+BS) for c in range(c1,c1+BS))
+                shift = avg - b_sum/(BS*BS)
+                if abs(shift) > 0.001:
+                    for r in range(r1, r1+BS):
+                        for c in range(c1, c1+BS):
+                            if not mask[r][c]:
+                                img[r][c] = max(0.0, min(1.0, img[r][c]+shift))
+
+        # Final clamp
+        result = []
         for r in range(N):
+            row = []
             for c in range(N):
-                if mask[r][c]:
-                    fixed[r][c] = True
+                v = img[r][c]
+                if v is None or v != v:
+                    row.append(float(self.global_mean))
                 else:
-                    non_fixed.append((r, c))
-
-        omega = 1.75
-        for _it in range(80):
-            if time.time() - self._t0 > 0.5:
-                break
-            max_change = 0.0
-            for r, c in non_fixed:
-                total = 0.0; cnt = 0
-                if r > 0:     total += img[r-1][c]; cnt += 1
-                if r < N-1:   total += img[r+1][c]; cnt += 1
-                if c > 0:     total += img[r][c-1]; cnt += 1
-                if c < N-1:   total += img[r][c+1]; cnt += 1
-                if cnt > 0:
-                    old = img[r][c]
-                    img[r][c] = old + omega * (total / cnt - old)
-                    d = abs(img[r][c] - old)
-                    if d > max_change: max_change = d
-            if max_change < 1e-5:
-                break
-
-        for br, bc in self.missing:
-            if (br, bc) in uniform_blocks:
-                continue
-            avg = self.recv_avgs.get((br, bc))
-            if avg is None:
-                continue
-            r1, c1 = br * BS, bc * BS
-
-            for qr1, qc1, qr2, qc2 in [
-                (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
-                (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9),
-            ]:
-                key = (qr1, qc1, qr2, qc2)
-                if key in quad_avgs:
-                    q_sum, q_cnt = 0.0, 0
-                    for r in range(qr1, qr2 + 1):
-                        for c in range(qc1, qc2 + 1):
-                            q_sum += img[r][c]; q_cnt += 1
-                    if q_cnt > 0:
-                        shift = quad_avgs[key] - q_sum / q_cnt
-                        for r in range(qr1, qr2 + 1):
-                            for c in range(qc1, qc2 + 1):
-                                if not fixed[r][c]:
-                                    img[r][c] = max(0.0, min(1.0, img[r][c] + shift))
-
-            b_sum = sum(img[r][c] for r in range(r1, r1+BS) for c in range(c1, c1+BS))
-            shift = avg - b_sum / (BS * BS)
-            if abs(shift) > 0.001:
-                for r in range(r1, r1 + BS):
-                    for c in range(c1, c1 + BS):
-                        if not fixed[r][c]:
-                            img[r][c] = max(0.0, min(1.0, img[r][c] + shift))
-
-    @staticmethod
-    def _detect_binary(all_vals):
-        if len(all_vals) < 100:
-            return False
-        near_0 = sum(1 for v in all_vals if v < 0.3)
-        near_1 = sum(1 for v in all_vals if v > 0.7)
-        mid = sum(1 for v in all_vals if 0.35 <= v <= 0.65)
-        total = len(all_vals)
-        return (near_0 + near_1) / total > 0.60 and mid / total < 0.25
+                    row.append(max(0.0, min(1.0, float(v))))
+            result.append(row)
+        return result
 
     def _neighbor_avg(self, br, bc):
         total, cnt = 0.0, 0
@@ -706,102 +520,9 @@ class SubmissionStrategy(Strategy):
             for dbc in (-1, 0, 1):
                 if dbr == 0 and dbc == 0:
                     continue
-                nb = (br + dbr, bc + dbc)
+                nb = (br+dbr, bc+dbc)
                 if nb in self.vis_means:
                     total += self.vis_means[nb]; cnt += 1
                 elif nb in self.recv_avgs:
                     total += self.recv_avgs[nb]; cnt += 1
-        return total / cnt if cnt > 0 else self.global_mean
-
-    @staticmethod
-    def _rect(req):
-        return _get_rect(req)
-
-    def _respond(self, req):
-        try:
-            if RegionAverageRequest is not None and isinstance(req, RegionAverageRequest):
-                return self._resp_avg(req)
-            if RegionRequest is not None and isinstance(req, RegionRequest):
-                return self._resp_region(req)
-            if SplitRequest is not None and isinstance(req, SplitRequest):
-                return self._resp_split(req)
-            cls_name = type(req).__name__
-            if 'Average' in cls_name:
-                return self._resp_avg(req)
-            if 'Split' in cls_name:
-                return self._resp_split(req)
-            if 'Region' in cls_name:
-                return self._resp_region(req)
-            rect = _get_rect(req)
-            if rect is not None:
-                return self._resp_region(req)
-        except BaseException:
-            pass
-        return None
-
-    def _resp_avg(self, req):
-        rect = _get_rect(req)
-        if rect is None:
-            return None
-        rr1, cc1, rr2, cc2 = rect
-        total, cnt = 0.0, 0
-        for r in range(max(0, rr1), min(self.n, rr2 + 1)):
-            for c in range(max(0, cc1), min(self.n, cc2 + 1)):
-                v = self.corrupted[r][c]
-                if v is not None:
-                    total += v; cnt += 1
-        if cnt == 0:
-            return None
-        return _make_msg(value=total / cnt)
-
-    def _resp_region(self, req):
-        rect = _get_rect(req)
-        if rect is None:
-            return None
-        rr1, cc1, rr2, cc2 = rect
-        cr = (rr1 + rr2) * 0.5
-        cc = (cc1 + cc2) * 0.5
-        best = None
-        best_d = 1e18
-        for r in range(max(0, rr1), min(self.n, rr2 + 1)):
-            for c in range(max(0, cc1), min(self.n, cc2 + 1)):
-                v = self.corrupted[r][c]
-                if v is not None:
-                    d = (r - cr) * (r - cr) + (c - cc) * (c - cc)
-                    if d < best_d:
-                        best = (r, c, v)
-                        best_d = d
-        if best is None:
-            return None
-        return _make_msg(row=best[0], col=best[1], value=best[2])
-
-    def _resp_split(self, req):
-        rect = _get_rect(req)
-        if rect is None:
-            return None
-        rr1, cc1, rr2, cc2 = rect
-        v1 = self.corrupted[rr1][cc1] if 0 <= rr1 < self.n and 0 <= cc1 < self.n else None
-        v2 = self.corrupted[rr2][cc2] if 0 <= rr2 < self.n and 0 <= cc2 < self.n else None
-        if v1 is None or v2 is None:
-            return None
-        return _make_msg(value=1.0 if abs(v1 - v2) > 0.15 else 0.0)
-
-    @staticmethod
-    def _extract_value(msg):
-        if msg is None:
-            return None
-        if isinstance(msg, (int, float)):
-            return float(msg)
-        # Try known names first
-        for attr in ("value", "mean", "average", "val"):
-            v = getattr(msg, attr, None)
-            if v is not None:
-                return float(v)
-        # Try introspected fields - first float field is likely the value
-        fields = _get_fields(type(msg))
-        if fields:
-            for fn in fields:
-                v = getattr(msg, fn, None)
-                if isinstance(v, (int, float)):
-                    return float(v)
-        return None
+        return total/cnt if cnt > 0 else self.global_mean
