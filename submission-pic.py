@@ -7,84 +7,64 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-def _import_types():
-    """Robustly import Strategy and request/message types from whatever module the server provides."""
-    import sys, os, importlib
-    names = ['Strategy', 'RegionRequest', 'RegionAverageRequest', 'SplitRequest', 'Message']
+def _find_in_modules(*names):
+    """Search sys.modules for the given names. Returns dict of name->value."""
+    import sys
     found = {}
-    # Modules that could cause circular imports (they import us)
-    _skip = {'submission', 'parse', '__main__'}
-
-    def _scan_module(mod):
+    for mod in list(sys.modules.values()):
+        if mod is None:
+            continue
         for name in names:
             if name not in found and hasattr(mod, name):
                 found[name] = getattr(mod, name)
-
-    # 1) Explicit guesses (NO parse — it imports us!)
-    for mod_name in ['strategy', 'game', 'game_types', 'models', 'base', 'common',
-                     'lib', 'types', 'utils', 'config', 'pic', 'image', 'core',
-                     'helpers', 'server', 'engine', 'shared', 'protocol', 'api',
-                     'definitions', 'interfaces', 'data_types', 'request', 'message']:
         if len(found) == len(names):
             break
-        if mod_name in _skip:
-            continue
+    return found
+
+def _find_strategy():
+    """Find the Strategy base class at import time."""
+    # Try known module names first
+    for mod_name in ['strategy', 'game', 'game_types']:
         try:
-            _scan_module(__import__(mod_name))
+            mod = __import__(mod_name)
+            if hasattr(mod, 'Strategy'):
+                return mod.Strategy
         except Exception:
             pass
+    # Search sys.modules
+    found = _find_in_modules('Strategy')
+    if 'Strategy' in found:
+        return found['Strategy']
+    # Fallback
+    class _Fallback:
+        def __init__(self, corrupted): self.corrupted_image = corrupted
+    return _Fallback
 
-    # 2) Search everything already loaded in sys.modules
-    if len(found) < len(names):
-        for mod in list(sys.modules.values()):
-            if mod is None:
-                continue
-            _scan_module(mod)
-            if len(found) == len(names):
-                break
+Strategy = _find_strategy()
 
-    # 3) Try importing every .py file next to us or in /app/ (skip dangerous ones)
-    if len(found) < len(names):
-        dirs_to_scan = set()
-        dirs_to_scan.add(os.path.dirname(os.path.abspath(__file__)))
-        dirs_to_scan.add('/app')
-        dirs_to_scan.add(os.getcwd())
-        for d in dirs_to_scan:
-            if not os.path.isdir(d):
-                continue
-            for fn in sorted(os.listdir(d)):
-                if not fn.endswith('.py'):
-                    continue
-                mod_name = fn[:-3]
-                if mod_name in _skip:
-                    continue
-                if mod_name in sys.modules:
-                    _scan_module(sys.modules[mod_name])
-                else:
-                    try:
-                        _scan_module(importlib.import_module(mod_name))
-                    except Exception:
-                        pass
-                if len(found) == len(names):
-                    break
+# These will be resolved lazily since parse.py may define them after importing us
+RegionRequest = None
+RegionAverageRequest = None
+SplitRequest = None
+Message = None
 
-    # 4) Fallback: if Strategy not found, use object so the class can still be defined
-    if 'Strategy' not in found:
-        class _FallbackStrategy:
-            def __init__(self, corrupted): self.corrupted_image = corrupted
-        found['Strategy'] = _FallbackStrategy
-
-    # 5) Fallback Message if not found
-    if 'Message' not in found:
+def _ensure_types():
+    """Lazily resolve request/message types from sys.modules (called on first use)."""
+    global RegionRequest, RegionAverageRequest, SplitRequest, Message
+    if RegionAverageRequest is not None:
+        return
+    found = _find_in_modules('RegionRequest', 'RegionAverageRequest', 'SplitRequest', 'Message')
+    RegionRequest = found.get('RegionRequest')
+    RegionAverageRequest = found.get('RegionAverageRequest')
+    SplitRequest = found.get('SplitRequest')
+    Message = found.get('Message')
+    # Fallback Message
+    if Message is None:
         class _FallbackMessage:
             def __init__(self, **kwargs):
                 for k, v in kwargs.items():
                     setattr(self, k, v)
-        found['Message'] = _FallbackMessage
-
-    return tuple(found.get(n) for n in names)
-
-Strategy, RegionRequest, RegionAverageRequest, SplitRequest, Message = _import_types()
+        Message = _FallbackMessage
 
 
 class SubmissionStrategy(Strategy):
@@ -143,6 +123,7 @@ class SubmissionStrategy(Strategy):
 
     # --------------------------------------------------------- make_requests
     def make_requests(self) -> list:
+        _ensure_types()
         reqs: list = []
         meta: list[tuple] = []
         BS = self.bs
