@@ -83,32 +83,51 @@ def _make_msg(**kw):
     return m
 
 
-# --- Class field introspection (discovers attribute names from actual classes) ---
+# --- Class field introspection (no imports, lightweight) ---
 _field_cache = {}  # cls -> tuple of field names
 
 
 def _get_fields(cls):
-    """Discover field names of a class using dataclasses.fields or inspect."""
+    """Discover field names without importing inspect/dataclasses."""
     if cls in _field_cache:
         return _field_cache[cls]
     names = None
+    # 1. dataclass: __dataclass_fields__ is an OrderedDict set by @dataclass
     try:
-        import dataclasses
-        names = tuple(f.name for f in dataclasses.fields(cls))
+        dcf = getattr(cls, '__dataclass_fields__', None)
+        if dcf:
+            names = tuple(dcf.keys())
     except Exception:
         pass
+    # 2. NamedTuple: has _fields attribute
     if names is None:
         try:
-            import inspect
-            sig = inspect.signature(cls)
-            names = tuple(p for p in sig.parameters if p != 'self')
+            nf = getattr(cls, '_fields', None)
+            if nf and isinstance(nf, tuple) and all(isinstance(f, str) for f in nf):
+                names = nf
         except Exception:
             pass
+    # 3. __init__ code object (works for any class with a standard __init__)
     if names is None:
-        # Try constructing a dummy and reading __dict__ key order
         try:
-            obj = cls(0, 0, 0, 0)
-            names = tuple(k for k in obj.__dict__ if not k.startswith('_'))
+            code = cls.__init__.__code__
+            names = tuple(code.co_varnames[1:code.co_argcount])
+        except (AttributeError, TypeError):
+            pass
+    # 4. class __annotations__
+    if names is None:
+        try:
+            ann = getattr(cls, '__annotations__', None)
+            if ann and isinstance(ann, dict) and len(ann) >= 4:
+                names = tuple(ann.keys())
+        except Exception:
+            pass
+    # 5. __slots__
+    if names is None:
+        try:
+            slots = getattr(cls, '__slots__', None)
+            if slots:
+                names = tuple(s for s in slots if not s.startswith('_'))
         except Exception:
             pass
     _field_cache[cls] = names
@@ -116,35 +135,63 @@ def _get_fields(cls):
 
 
 def _make_req(cls, a, b, c, d):
-    """Construct a request using introspected field names, positional, or kwargs."""
+    """Construct a request with 4 positional values."""
+    # Positional first — works for most types including NamedTuples
+    try:
+        return cls(a, b, c, d)
+    except Exception:
+        pass
+    # Kwargs using discovered field names
     fields = _get_fields(cls)
     if fields and len(fields) >= 4:
         try:
             return cls(**{fields[0]: a, fields[1]: b, fields[2]: c, fields[3]: d})
         except Exception:
             pass
-    try:
-        return cls(a, b, c, d)
-    except Exception:
-        pass
     return None
 
 
 def _get_rect(req):
-    """Extract (r1,c1,r2,c2) from a request using introspected field names."""
+    """Extract (r1,c1,r2,c2) from a request object."""
     cls = type(req)
+    # 1. Try introspected field names
     fields = _get_fields(cls)
     if fields and len(fields) >= 4:
         try:
             return tuple(int(getattr(req, fields[i])) for i in range(4))
         except Exception:
             pass
-    # Fallback: try __dict__ ordered values
-    if hasattr(req, '__dict__'):
-        vals = [v for k, v in req.__dict__.items()
-                if not k.startswith('_') and isinstance(v, (int, float))]
-        if len(vals) >= 4:
-            return tuple(int(v) for v in vals[:4])
+    # 2. Try __dict__ ordered values (Python 3.7+ preserves insertion order)
+    try:
+        d = getattr(req, '__dict__', None)
+        if d:
+            vals = [v for k, v in d.items()
+                    if not k.startswith('_') and isinstance(v, (int, float))]
+            if len(vals) >= 4:
+                return tuple(int(v) for v in vals[:4])
+    except Exception:
+        pass
+    # 3. Try __slots__
+    try:
+        slots = getattr(cls, '__slots__', None)
+        if slots:
+            vals = []
+            for s in slots:
+                if s.startswith('_'):
+                    continue
+                v = getattr(req, s, None)
+                if isinstance(v, (int, float)):
+                    vals.append(int(v))
+            if len(vals) >= 4:
+                return tuple(vals[:4])
+    except Exception:
+        pass
+    # 4. Try index access (NamedTuple / tuple-like)
+    try:
+        if hasattr(req, '__getitem__') and hasattr(req, '__len__') and len(req) >= 4:
+            return tuple(int(req[i]) for i in range(4))
+    except Exception:
+        pass
     return None
 
 
@@ -396,12 +443,14 @@ class SubmissionStrategy(Strategy):
         for r in range(N):
             for c in range(N):
                 v = img[r][c]
-                if v is None:
+                if v is None or v != v:  # v != v catches NaN
                     img[r][c] = self.global_mean
                 elif v < 0.0:
                     img[r][c] = 0.0
                 elif v > 1.0:
                     img[r][c] = 1.0
+                else:
+                    img[r][c] = float(v)
 
         return img
 
@@ -462,8 +511,8 @@ class SubmissionStrategy(Strategy):
                     non_fixed.append((r, c))
 
         omega = 1.75
-        for _it in range(120):
-            if time.time() - self._t0 > 0.7:
+        for _it in range(80):
+            if time.time() - self._t0 > 0.5:
                 break
             max_change = 0.0
             for r, c in non_fixed:
@@ -590,8 +639,8 @@ class SubmissionStrategy(Strategy):
                     non_fixed.append((r, c))
 
         omega = 1.75
-        for _it in range(120):
-            if time.time() - self._t0 > 0.7:
+        for _it in range(80):
+            if time.time() - self._t0 > 0.5:
                 break
             max_change = 0.0
             for r, c in non_fixed:
