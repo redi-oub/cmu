@@ -1,27 +1,30 @@
 """
 CMIMC PIC – Image Recovery Strategy (Optimized v4)
 """
+from __future__ import annotations
 import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-try:
-    from strategy import Strategy
-    from strategy import (
-        RegionRequest, RegionAverageRequest, SplitRequest, Message,
-    )
-except ImportError:
-    try:
-        from game import (
-            Strategy, RegionRequest, RegionAverageRequest,
-            SplitRequest, Message,
-        )
-    except ImportError:
-        from game_types import (
-            Strategy, RegionRequest, RegionAverageRequest,
-            SplitRequest, Message,
-        )
+def _import_types():
+    """Robustly import Strategy and request/message types from whatever module the server provides."""
+    names = ['Strategy', 'RegionRequest', 'RegionAverageRequest', 'SplitRequest', 'Message']
+    modules_to_try = ['strategy', 'game', 'game_types']
+    found = {}
+    for mod_name in modules_to_try:
+        try:
+            mod = __import__(mod_name)
+        except ImportError:
+            continue
+        for name in names:
+            if name not in found and hasattr(mod, name):
+                found[name] = getattr(mod, name)
+        if len(found) == len(names):
+            break
+    return tuple(found.get(n) for n in names)
+
+Strategy, RegionRequest, RegionAverageRequest, SplitRequest, Message = _import_types()
 
 
 class SubmissionStrategy(Strategy):
