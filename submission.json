@@ -1,0 +1,228 @@
+{
+  "solve1.json": {
+    "bitwidth": 2,
+    "operations": [
+      "send",
+      "ifzhalt"
+    ],
+    "rings": [
+      [
+        {
+          "position": 0,
+          "bitstring": "10"
+        }
+      ],
+      [
+        {
+          "position": 350,
+          "bitstring": "10"
+        },
+        {
+          "position": 340,
+          "bitstring": "10"
+        },
+        {
+          "position": 90,
+          "bitstring": "01"
+        }
+      ],
+      [
+        {
+          "position": 355,
+          "bitstring": "10",
+          "input": 0
+        },
+        {
+          "position": 345,
+          "bitstring": "10",
+          "input": 1
+        },
+        {
+          "position": 90,
+          "bitstring": "01"
+        }
+      ]
+    ]
+  },
+  "solve2.json": {
+    "bitwidth": 2,
+    "operations": [
+      "drop",
+      "ifzhalt"
+    ],
+    "rings": [
+      [
+        {
+          "position": 0,
+          "bitstring": "10",
+          "input": 0
+        }
+      ],
+      [
+        {
+          "position": 359,
+          "bitstring": "11",
+          "input": 1
+        }
+      ],
+      [
+        {
+          "position": 0,
+          "bitstring": "01"
+        }
+      ]
+    ]
+  },
+  "solve3.json": {
+    "bitwidth": 4,
+    "operations": [
+      "send",
+      "copy",
+      "give",
+      "ifzhalt"
+    ],
+    "rings": [
+      [
+        {
+          "position": 0,
+          "bitstring": "1000"
+        }
+      ],
+      [
+        {
+          "position": 160,
+          "bitstring": "1100"
+        }
+      ],
+      [
+        {
+          "position": 260,
+          "bitstring": "1100",
+          "input": 0
+        }
+      ],
+      [
+        {
+          "position": 30,
+          "bitstring": "0010"
+        }
+      ],
+      [
+        {
+          "position": 50,
+          "bitstring": "0011",
+          "input": 1
+        }
+      ],
+      [
+        {
+          "position": 40,
+          "bitstring": "0001"
+        }
+      ]
+    ]
+  },
+  "solve4.json": {
+    "bitwidth": 3,
+    "operations": [
+      "gen",
+      "drop",
+      "ifzhalt"
+    ],
+    "rings": [
+      [
+        {
+          "position": 0,
+          "bitstring": "100"
+        }
+      ],
+      [
+        {
+          "position": 290,
+          "bitstring": "110"
+        }
+      ],
+      [
+        {
+          "position": 100,
+          "bitstring": "011",
+          "input": 0
+        },
+        {
+          "position": 200,
+          "bitstring": "011",
+          "input": 1
+        },
+        {
+          "position": 300,
+          "bitstring": "100"
+        }
+      ],
+      [
+        {
+          "position": 50,
+          "bitstring": "001"
+        },
+        {
+          "position": 160,
+          "bitstring": "001"
+        }
+      ]
+    ]
+  },
+  "solve5.json": {
+    "bitwidth": 3,
+    "operations": [
+      "ifzhalt",
+      "take",
+      "gen"
+    ],
+    "rings": [
+      [
+        {
+          "position": 0,
+          "bitstring": "001"
+        }
+      ],
+      [
+        {
+          "position": 100,
+          "bitstring": "001"
+        }
+      ],
+      [
+        {
+          "position": 100,
+          "bitstring": "010",
+          "input": 0
+        },
+        {
+          "position": 150,
+          "bitstring": "010",
+          "input": 1
+        }
+      ],
+      [
+        {
+          "position": 80,
+          "bitstring": "110"
+        }
+      ],
+      [
+        {
+          "position": 200,
+          "bitstring": "110"
+        },
+        {
+          "position": 250,
+          "bitstring": "010"
+        }
+      ]
+    ]
+  },
+  "solve6.json": {},
+  "solve7.json": {},
+  "solve8.json": {},
+  "solve9.json": {},
+  "solve10.json": {}
+}
