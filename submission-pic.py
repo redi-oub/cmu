@@ -3,8 +3,15 @@ CMIMC PIC – Image Recovery Strategy (Optimized v4)
 """
 from __future__ import annotations
 import sys
+import os
 from typing import Optional
 
+def _dbg(msg):
+    """Write debug info to stderr so it doesn't corrupt stdout JSON."""
+    try:
+        print(f"[DBG] {msg}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
 
 def _get(name):
     """Safely get a name from __main__ or known modules."""
@@ -14,6 +21,7 @@ def _get(name):
         try:
             v = getattr(main, name, None)
             if v is not None:
+                _dbg(f"Found {name} in __main__: {v}")
                 return v
         except Exception:
             pass
@@ -24,6 +32,7 @@ def _get(name):
             try:
                 v = getattr(mod, name, None)
                 if v is not None:
+                    _dbg(f"Found {name} in sys.modules[{mod_name}]: {v}")
                     return v
             except Exception:
                 pass
@@ -32,18 +41,34 @@ def _get(name):
                 mod = __import__(mod_name)
                 v = getattr(mod, name, None)
                 if v is not None:
+                    _dbg(f"Found {name} via import {mod_name}: {v}")
                     return v
             except Exception:
                 pass
+    _dbg(f"NOT FOUND: {name}")
     return None
 
 
+# Debug: list all modules and files at import time
+_dbg(f"Python {sys.version}")
+_dbg(f"__file__={__file__}, cwd={os.getcwd()}")
+_dbg(f"sys.modules keys: {sorted(sys.modules.keys())}")
+try:
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    _dbg(f"Files in {app_dir}: {os.listdir(app_dir)}")
+except Exception as e:
+    _dbg(f"listdir error: {e}")
+
 # Strategy is needed at import time for class definition
+_dbg("Looking for Strategy...")
 Strategy = _get('Strategy')
 if Strategy is None:
+    _dbg("Strategy NOT FOUND - using fallback")
     class Strategy:
         def __init__(self, corrupted):
             self.corrupted_image = corrupted
+else:
+    _dbg(f"Strategy = {Strategy}")
 
 # These will be resolved lazily since parse.py may define them AFTER importing us
 RegionRequest = None
@@ -58,11 +83,18 @@ def _ensure_types():
     if _types_resolved:
         return
     _types_resolved = True
+    _dbg("_ensure_types() running...")
+    _dbg(f"sys.modules keys now: {sorted(sys.modules.keys())}")
+    main = sys.modules.get('__main__')
+    if main is not None:
+        _dbg(f"__main__ dir: {[x for x in dir(main) if not x.startswith('_')]}")
     RegionRequest = _get('RegionRequest')
     RegionAverageRequest = _get('RegionAverageRequest')
     SplitRequest = _get('SplitRequest')
     Message = _get('Message')
+    _dbg(f"Resolved: RR={RegionRequest}, RAR={RegionAverageRequest}, SR={SplitRequest}, M={Message}")
     if Message is None:
+        _dbg("Message NOT FOUND - using fallback")
         class _Msg:
             def __init__(self, **kw):
                 for k, v in kw.items():
@@ -73,6 +105,7 @@ def _ensure_types():
 class SubmissionStrategy(Strategy):
 
     def __init__(self, corrupted: list[list[Optional[float]]]):
+        _dbg("SubmissionStrategy.__init__ called")
         super().__init__(corrupted)
         N = 50
         BS = 10
@@ -126,7 +159,9 @@ class SubmissionStrategy(Strategy):
 
     # --------------------------------------------------------- make_requests
     def make_requests(self) -> list:
+        _dbg("make_requests() called")
         _ensure_types()
+        _dbg(f"Types after ensure: RAR={RegionAverageRequest}, RR={RegionRequest}, M={Message}")
         reqs: list = []
         meta: list[tuple] = []
         BS = self.bs
@@ -176,10 +211,12 @@ class SubmissionStrategy(Strategy):
                 meta.append(("pix", br, bc, r1+dr, c1+dc))
 
         self.req_meta = meta
+        _dbg(f"make_requests returning {len(reqs)} requests")
         return reqs
 
     # ------------------------------------------------------ receive_requests
     def receive_requests(self, requests: list) -> list:
+        _dbg(f"receive_requests called with {len(requests)} requests")
         responses: list = []
         answered = 0
         for req in requests:
@@ -194,6 +231,7 @@ class SubmissionStrategy(Strategy):
 
     # ------------------------------------------------------ receive_messages
     def receive_messages(self, messages: list) -> None:
+        _dbg(f"receive_messages called with {len(messages)} messages")
         for i, msg in enumerate(messages):
             if msg is None or i >= len(self.req_meta):
                 continue
@@ -217,6 +255,8 @@ class SubmissionStrategy(Strategy):
 
     # ---------------------------------------------------------------- recover
     def recover(self) -> list[list[Optional[float]]]:
+        _dbg(f"recover() called. recv_avgs={len(self.recv_avgs)}, recv_pixels={len(self.recv_pixels)}, recv_quads={len(self.recv_quad_avgs)}")
+        _dbg(f"is_binary={self.is_binary}, visible={len(self.visible)}, missing={len(self.missing)}")
         N = self.n
         BS = self.bs
         img = self.image
@@ -254,6 +294,7 @@ class SubmissionStrategy(Strategy):
                 elif v > 1.0:
                     img[r][c] = 1.0
 
+        _dbg(f"recover() done. Sample pixel values: {[img[0][c] for c in range(5)]}")
         return img
 
     def _recover_binary(self, img, mask):
