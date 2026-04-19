@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
-"""Lemon Tycoon AI - competitive strategy v6.
+"""Lemon Tycoon AI — competitive strategy v15.
 
-Key discovery: server uses 2*log2(k) (continuous, NO floor) for production.
-ID 15 produces 7.81 (97.7% of ID 16's 8.0), ID 14 produces 7.62.
+Production: 2*log2(k) (continuous). ID 16→8.0, ID 15→7.81, ID 14→7.61.
+
+KEY INSIGHT: Instead of defending against sabotage of 16, AVOID 16 entirely
+and SABOTAGE 16 ourselves to cripple pure-16 opponents.
 
 Strategy:
-1. Default: pure ID 16 for maximum growth.
-2. Sell-to-win: sell as soon as we CAN cross goal AND an opponent is close.
-3. After our factories get sabotaged: temporarily diversify to IDs 14-15
-   (nearly as productive as 16 but different sabotage targets).
-   Recover to pure 16 after 3 rounds without new sabotage on our IDs.
-4. After mass sabotage (5+ IDs): fall back to IDs 4-7 (safe low-value IDs).
+1. BUY IDs 15+14 (never 16). Immune to ID-16 sabotage (the most common
+   target). Avg production 7.71/fac — only 3.6% slower than pure 16.
+2. SABOTAGE ID 16 periodically: destroys pure-16 opponents' factories.
+   Adaptive: stops if no enemies use 16 (waste detection).
+3. REACTIVE SWITCH: If 15 or 14 gets sabotaged, shift to next-best ID.
+4. SKIP-BUY WIN: When production alone crosses goal, skip buying.
+5. SELL-TO-WIN: Sell factories when optimal.
 """
 
 import logging
@@ -70,32 +73,33 @@ class SubmissionPlayer(Player):
         self.prod = [production_rate(k) for k in range(self.num_ids + 1)]
         self.max_id = self.num_ids
 
+        # Sabotage tracking
         self.last_sabotaged_round = {}
-        self.sabotaged_ids_ever = set()
-        self.total_sab_events = 0
-        self.last_our_sab_round = -1
-        self.mass_sab_seen = False
-        self.mass_sab_rounds = 0
+        self.sab_count_by_id = {}
+        self.any_sabotage_seen = False
 
+        # Evidence from destroyed_factory_counts
+        self.confirmed_enemy_round = {}
+
+        # Opponent estimation
         self.prev_lemons = [initial_lemons] * num_players
         self.est_production = [0.0] * num_players
 
-        self.confirmed_enemy_ids = set()
-        self.destroyed_totals = {}
-        self.own_counts = {}
+        # Our factory tracking
+        self.prev_our_factories = {}
+
+        # Offensive sabotage state
+        self.sab_cooldown = 0
+        self.enemies_use_max_id = True  # assume yes until proven otherwise
+        self.sabotaged_max_last_round = False  # did anyone (incl us) sabotage max_id last round?
+        self.detected_saboteur = False  # is there an opponent who sabotages?
 
     def _idx_to_id(self, idx, facs_len):
-        """Convert array index to factory ID.
-
-        Local engine: length num_ids+1, index=ID (index 0 unused).
-        Server may use length num_ids, where index i = ID i+1.
-        """
         if facs_len > self.num_ids:
             return idx
         return idx + 1
 
     def _id_to_idx(self, fid, facs_len):
-        """Convert factory ID to array index."""
         if facs_len > self.num_ids:
             return fid
         return fid - 1
@@ -110,12 +114,31 @@ class SubmissionPlayer(Player):
         total = 0
         for idx in range(len(facs)):
             fid = self._idx_to_id(idx, len(facs))
-            p = self.prod[fid] if fid < len(self.prod) else 0
-            total += facs[idx] * p
+            if 0 < fid < len(self.prod):
+                total += facs[idx] * self.prod[fid]
         return total
 
     def _total_fac(self, facs):
         return sum(facs)
+
+    def _best_unsabotaged_id(self, round_number, cooldown=5):
+        """Return the single highest-production ID that's safe to buy.
+        Uses long cooldown (5) so we don't cycle back to targeted IDs."""
+        for fid in range(self.max_id, 0, -1):
+            if self.prod[fid] <= 0:
+                continue
+            last_sab = self.last_sabotaged_round.get(fid, -100)
+            if (round_number - last_sab) <= cooldown:
+                continue
+            # If sabotaged 2+ times, it's being actively targeted — avoid permanently
+            if self.sab_count_by_id.get(fid, 0) >= 2:
+                continue
+            return fid
+        # Fallback: least-targeted high-production ID
+        all_ids = [(self.sab_count_by_id.get(fid, 0), -self.prod[fid], fid)
+                   for fid in range(self.max_id, 0, -1) if self.prod[fid] > 0]
+        all_ids.sort()
+        return all_ids[0][2] if all_ids else self.max_id
 
     def play(self, round_number, your_lemons, your_factories,
              all_lemons, destroyed_factory_counts, sabotages_by_player):
@@ -124,84 +147,94 @@ class SubmissionPlayer(Player):
         sells = []
         sabotages = []
         budget = your_lemons
+        facs_len = len(your_factories)
 
-        round_sab_ids = set()
+        # ── Update sabotage tracking ──
+        max_id_sabotaged_this_report = False
         for pid in range(self.num_players):
             for sid in sabotages_by_player[pid]:
-                round_sab_ids.add(sid)
-                self.last_sabotaged_round[sid] = max(round_number - 1, 0)
-                self.total_sab_events += 1
-                self.sabotaged_ids_ever.add(sid)
-        if len(round_sab_ids) >= 5:
-            self.mass_sab_rounds += 1
-            self.mass_sab_seen = True
+                self.last_sabotaged_round[sid] = round_number - 1
+                self.sab_count_by_id[sid] = self.sab_count_by_id.get(sid, 0) + 1
+                self.any_sabotage_seen = True
+                if sid == self.max_id:
+                    max_id_sabotaged_this_report = True
+                # Detect if a non-us player is a saboteur
+                if pid != self.player_id:
+                    self.detected_saboteur = True
 
-        for fid, cnt in destroyed_factory_counts.items():
-            self.destroyed_totals[fid] = self.destroyed_totals.get(fid, 0) + cnt
-            our_had = self.own_counts.get(fid, 0)
-            if our_had > 0 and fid in round_sab_ids:
-                self.last_our_sab_round = round_number
-            if cnt > our_had:
-                self.confirmed_enemy_ids.add(fid)
+        # Adaptive: if max_id was sabotaged but nothing was found there,
+        # nobody uses it — stop wasting money sabotaging it
+        if self.sabotaged_max_last_round:
+            if self.max_id not in destroyed_factory_counts:
+                self.enemies_use_max_id = False
+            else:
+                # Check if only OUR factories were destroyed (shouldn't happen
+                # since we don't buy max_id, but be safe)
+                our_prev_max = self.prev_our_factories.get(self.max_id, 0)
+                our_now_max = self._fac_at(your_factories, self.max_id)
+                our_lost_max = max(0, our_prev_max - our_now_max)
+                enemy_destroyed_max = max(0, destroyed_factory_counts[self.max_id] - our_lost_max)
+                if enemy_destroyed_max == 0:
+                    self.enemies_use_max_id = False
+        self.sabotaged_max_last_round = max_id_sabotaged_this_report
 
+        # ── Update evidence-based enemy tracking ──
+        for fid, total_destroyed in destroyed_factory_counts.items():
+            self.confirmed_enemy_round[fid] = round_number
+
+        # Save factory state
+        self.prev_our_factories = {}
+        for idx in range(facs_len):
+            fid = self._idx_to_id(idx, facs_len)
+            if your_factories[idx] > 0:
+                self.prev_our_factories[fid] = your_factories[idx]
+
+        # ── Estimate opponent production ──
         for pid in range(self.num_players):
             if pid == self.player_id:
                 continue
             delta = all_lemons[pid] - self.prev_lemons[pid]
-            sab_cost = len(sabotages_by_player[pid]) * self.sabotage_cost
-            est = max(0.0, delta + sab_cost)
-            if round_number <= 2:
-                self.est_production[pid] = est
-            else:
-                self.est_production[pid] = 0.35 * est + 0.65 * self.est_production[pid]
+            sab_spent = len(sabotages_by_player[pid]) * self.sabotage_cost
+            est = max(0.0, delta + sab_spent)
+            alpha = 0.4 if round_number <= 3 else 0.25
+            self.est_production[pid] = alpha * est + (1 - alpha) * self.est_production[pid]
 
+        # ── Game state ──
         my_prod = self._my_production(your_factories)
         total_fac = self._total_fac(your_factories)
         rounds_left = self.max_rounds - round_number
-
-        leader_idx = -1
-        leader_lemons = 0.0
-        for pid in range(self.num_players):
-            if pid != self.player_id:
-                if all_lemons[pid] > leader_lemons:
-                    leader_lemons = all_lemons[pid]
-                    leader_idx = pid
-
         my_total_value = budget + total_fac * self.sell_price
-
-        opponent_close = False
-        for pid in range(self.num_players):
-            if pid != self.player_id:
-                opp_est = all_lemons[pid] + self.est_production[pid]
-                if opp_est >= self.goal_lemons * 0.80:
-                    opponent_close = True
-                    break
-
-        can_win = my_total_value >= self.goal_lemons
-
         max_lemons = max(all_lemons) if all_lemons else 0
-        progress = max(max_lemons / self.goal_lemons,
-                       round_number / self.max_rounds) if self.goal_lemons > 0 else 0
+
+        # ── WIN: production alone crosses goal ──
+        if budget + my_prod >= self.goal_lemons:
+            self.prev_lemons = list(all_lemons)
+            return [], [], []
+
+        # ── Opponent threat ──
+        opp_imminent = False
+        for pid in range(self.num_players):
+            if pid == self.player_id:
+                continue
+            if all_lemons[pid] + self.est_production[pid] >= self.goal_lemons * 0.80:
+                opp_imminent = True
+                break
 
         someone_at_goal = max_lemons >= self.goal_lemons
 
-        will_production_win = (budget + my_prod >= self.goal_lemons)
-
-        should_sell = can_win and (
-            opponent_close
-            or someone_at_goal
-            or (progress >= 0.48 and not will_production_win)
+        # ── SELL to win ──
+        can_win_by_selling = my_total_value >= self.goal_lemons
+        should_sell = can_win_by_selling and (
+            someone_at_goal or opp_imminent or rounds_left <= 1
         )
 
         if should_sell:
             needed = self.goal_lemons - budget
             if needed <= 0:
                 self.prev_lemons = list(all_lemons)
-                return buys, sells, sabotages
+                return [], [], []
             num_to_sell = math.ceil(needed / self.sell_price)
             if num_to_sell <= total_fac:
-                count_needed = num_to_sell
-                facs_len = len(your_factories)
                 sell_pairs = []
                 for idx in range(facs_len):
                     cnt = your_factories[idx]
@@ -210,67 +243,75 @@ class SubmissionPlayer(Player):
                         p = self.prod[fid] if fid < len(self.prod) else 0
                         sell_pairs.append((fid, cnt, p))
                 sell_pairs.sort(key=lambda x: x[2])
+                count_needed = num_to_sell
                 for fid, cnt, _ in sell_pairs:
                     if count_needed <= 0:
                         break
                     to_sell = min(cnt, count_needed)
-                    for _ in range(to_sell):
-                        sells.append(fid)
-                        budget += self.sell_price
-                        count_needed -= 1
+                    sells.extend([fid] * to_sell)
+                    budget += to_sell * self.sell_price
+                    count_needed -= to_sell
                 self.prev_lemons = list(all_lemons)
                 return buys, sells, sabotages
 
-        my_rank = 1
-        for pid in range(self.num_players):
-            if pid != self.player_id and all_lemons[pid] > budget:
-                my_rank += 1
-
-        if (leader_idx >= 0 and my_rank > 1
-                and leader_lemons >= self.goal_lemons * 0.85):
-            best_fid = -1
-            best_net = -999999.0
-            for fid in self.confirmed_enemy_ids:
-                if fid < 1 or fid >= len(self.prod) or self.prod[fid] <= 0:
-                    continue
-                our_cnt = self._fac_at(your_factories, fid)
-                est_enemy = max(1.0, self.destroyed_totals.get(fid, 0) * 0.2)
-                val = self.prod[fid] + self.sell_price
-                net = est_enemy * val - our_cnt * val * (self.num_players - 1) - self.sabotage_cost
-                if net > best_net:
-                    best_net = net
-                    best_fid = fid
-            if best_fid > 0 and budget >= self.sabotage_cost + self.buy_price:
-                if best_net > 0 or leader_lemons >= self.goal_lemons * 0.92:
-                    sabotages.append(best_fid)
+        # ── OFFENSIVE SABOTAGE ──
+        self.sab_cooldown = max(0, self.sab_cooldown - 1)
+        if (self.sab_cooldown == 0
+                and round_number >= 6
+                and budget >= self.sabotage_cost + self.buy_price):
+            if self.enemies_use_max_id:
+                # Sabotage ID 16 — destroys pure-16 opponents
+                sabotages.append(self.max_id)
+                budget -= self.sabotage_cost
+                self.sab_cooldown = 3
+            elif self.detected_saboteur and round_number >= 10:
+                # Nobody uses 16, but there's a saboteur. They likely use
+                # IDs 13 or below (which we don't own). Sabotage 13.
+                counter_id = self.max_id - 3  # ID 13
+                if self._fac_at(your_factories, counter_id) == 0:
+                    sabotages.append(counter_id)
                     budget -= self.sabotage_cost
+                    self.sab_cooldown = 5
 
-        if rounds_left <= 1:
+        # No buying on last round
+        if rounds_left <= 0:
             self.prev_lemons = list(all_lemons)
             return buys, sells, sabotages
 
-        id16_last_sab = self.last_sabotaged_round.get(self.max_id, -100)
-        id16_hot = (round_number - id16_last_sab) <= 2
+        # ── BUY DECISION ──
+        # Pick the 2 highest-production IDs below max_id that haven't been
+        # sabotaged recently. Never buy max_id (our sabotage target).
+        buy_ids = []
+        for fid in range(self.max_id - 1, 0, -1):
+            if self.sab_count_by_id.get(fid, 0) >= 2:
+                continue
+            if self.last_sabotaged_round.get(fid, -100) >= round_number - 5:
+                continue
+            buy_ids.append(fid)
+            if len(buy_ids) >= 2:
+                break
+        if not buy_ids:
+            # Fallback: use least-sabotaged IDs
+            all_ids = [(self.sab_count_by_id.get(f, 0), -self.prod[f], f)
+                       for f in range(self.max_id - 1, 0, -1) if self.prod[f] > 0]
+            all_ids.sort()
+            buy_ids = [f for _, _, f in all_ids[:2]]
 
-        if self.mass_sab_seen:
-            pool = list(range(4, 8))
-        elif id16_hot:
-            best_safe = None
-            for fid in [15, 14, 13, 12]:
-                if self.last_sabotaged_round.get(fid, -100) < round_number - 1:
-                    best_safe = fid
-                    break
-            pool = [best_safe if best_safe else 7]
-        else:
-            pool = [self.max_id]
+        primary_id = buy_ids[0] if buy_ids else self.max_id - 1
+        secondary_id = buy_ids[1] if len(buy_ids) > 1 else primary_id
 
-        while budget >= self.buy_price and pool:
-            buys.append(pool[0])
-            budget -= self.buy_price
-            bidx = self._id_to_idx(pool[0], len(your_factories))
-            if 0 <= bidx < len(your_factories):
-                your_factories[bidx] += 1
-            self.own_counts[pool[0]] = self.own_counts.get(pool[0], 0) + 1
+        num_buy = int(budget // self.buy_price)
+        if num_buy > 0:
+            # Balanced 50/50 alternation
+            my_p = self._fac_at(your_factories, primary_id)
+            my_s = self._fac_at(your_factories, secondary_id)
+            for _ in range(num_buy):
+                if my_p <= my_s:
+                    buys.append(primary_id)
+                    my_p += 1
+                else:
+                    buys.append(secondary_id)
+                    my_s += 1
 
         self.prev_lemons = list(all_lemons)
         return buys, sells, sabotages
