@@ -1,5 +1,6 @@
 """CMIMC PIC - Image Recovery Strategy"""
 import sys
+import time
 
 # --- Import Strategy at module level (needed for class definition) ---
 Strategy = None
@@ -28,43 +29,52 @@ Message = None
 _types_resolved = False
 
 
+def _lookup(name):
+    """Find a name in __main__ or known modules."""
+    _main = sys.modules.get('__main__')
+    if _main:
+        val = getattr(_main, name, None)
+        if val is not None:
+            return val
+    for _mn in ['strategy', 'game', 'game_types']:
+        _m = sys.modules.get(_mn)
+        if _m:
+            val = getattr(_m, name, None)
+            if val is not None:
+                return val
+        else:
+            try:
+                _m = __import__(_mn)
+                val = getattr(_m, name, None)
+                if val is not None:
+                    return val
+            except Exception:
+                pass
+    return None
+
+
 def _ensure_types():
     global RegionRequest, RegionAverageRequest, SplitRequest, Message, _types_resolved
     if _types_resolved:
         return
     _types_resolved = True
-    for name in ['RegionRequest', 'RegionAverageRequest', 'SplitRequest', 'Message']:
-        val = None
-        _main = sys.modules.get('__main__')
-        if _main:
-            val = getattr(_main, name, None)
-        if val is None:
-            for _mn in ['strategy', 'game', 'game_types']:
-                _m = sys.modules.get(_mn)
-                if _m:
-                    val = getattr(_m, name, None)
-                    if val is not None:
-                        break
-                else:
-                    try:
-                        _m = __import__(_mn)
-                        val = getattr(_m, name, None)
-                        if val is not None:
-                            break
-                    except Exception:
-                        pass
-        globals()[name] = val
-    if globals()['Message'] is None:
+    RegionRequest = _lookup('RegionRequest')
+    RegionAverageRequest = _lookup('RegionAverageRequest')
+    SplitRequest = _lookup('SplitRequest')
+    Message = _lookup('Message')
+    if Message is None:
         class _Msg:
             def __init__(self, **kw):
                 self.__dict__.update(kw)
-        globals()['Message'] = _Msg
+        Message = _Msg
 
 
 class SubmissionStrategy(Strategy):
 
     def __init__(self, corrupted):
         super().__init__(corrupted)
+        self._t0 = time.time()
+        self._init_ok = False
         N = 50
         BS = 10
         self.n = N
@@ -111,9 +121,14 @@ class SubmissionStrategy(Strategy):
         self.recv_avgs = {}
         self.recv_pixels = {}
         self.recv_quad_avgs = {}
+        self._init_ok = True
 
     def make_requests(self):
+        if not self._init_ok:
+            return []
         _ensure_types()
+        if RegionAverageRequest is None or RegionRequest is None:
+            return []
         reqs = []
         meta = []
         BS = self.bs
@@ -196,6 +211,21 @@ class SubmissionStrategy(Strategy):
                     self.recv_pixels[(m[3], m[4])] = val
 
     def recover(self):
+        try:
+            return self._do_recover()
+        except Exception:
+            # Fallback: return corrupted image with 0.5 for missing
+            N = self.n
+            result = []
+            for r in range(N):
+                row = []
+                for c in range(N):
+                    v = self.corrupted[r][c]
+                    row.append(v if v is not None else 0.5)
+                result.append(row)
+            return result
+
+    def _do_recover(self):
         N = self.n
         BS = self.bs
         img = self.image
@@ -288,7 +318,9 @@ class SubmissionStrategy(Strategy):
                     non_fixed.append((r, c))
 
         omega = 1.75
-        for _ in range(200):
+        for _it in range(120):
+            if time.time() - self._t0 > 0.7:
+                break
             max_change = 0.0
             for r, c in non_fixed:
                 total = 0.0; cnt = 0
@@ -414,7 +446,9 @@ class SubmissionStrategy(Strategy):
                     non_fixed.append((r, c))
 
         omega = 1.75
-        for _ in range(200):
+        for _it in range(120):
+            if time.time() - self._t0 > 0.7:
+                break
             max_change = 0.0
             for r, c in non_fixed:
                 total = 0.0; cnt = 0
