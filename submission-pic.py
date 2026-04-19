@@ -2,69 +2,72 @@
 CMIMC PIC – Image Recovery Strategy (Optimized v4)
 """
 from __future__ import annotations
-import logging
+import sys
 from typing import Optional
 
-logger = logging.getLogger(__name__)
 
-def _find_in_modules(*names):
-    """Search sys.modules for the given names. Returns dict of name->value."""
-    import sys
-    found = {}
-    for mod in list(sys.modules.values()):
-        if mod is None:
-            continue
-        for name in names:
-            if name not in found and hasattr(mod, name):
-                found[name] = getattr(mod, name)
-        if len(found) == len(names):
-            break
-    return found
-
-def _find_strategy():
-    """Find the Strategy base class at import time."""
-    # Try known module names first
-    for mod_name in ['strategy', 'game', 'game_types']:
+def _get(name):
+    """Safely get a name from __main__ or known modules."""
+    # 1) Check __main__ first (parse.py runs as __main__)
+    main = sys.modules.get('__main__')
+    if main is not None:
         try:
-            mod = __import__(mod_name)
-            if hasattr(mod, 'Strategy'):
-                return mod.Strategy
+            v = getattr(main, name, None)
+            if v is not None:
+                return v
         except Exception:
             pass
-    # Search sys.modules
-    found = _find_in_modules('Strategy')
-    if 'Strategy' in found:
-        return found['Strategy']
-    # Fallback
-    class _Fallback:
-        def __init__(self, corrupted): self.corrupted_image = corrupted
-    return _Fallback
+    # 2) Check specific safe module names
+    for mod_name in ['strategy', 'game', 'game_types']:
+        mod = sys.modules.get(mod_name)
+        if mod is not None:
+            try:
+                v = getattr(mod, name, None)
+                if v is not None:
+                    return v
+            except Exception:
+                pass
+        else:
+            try:
+                mod = __import__(mod_name)
+                v = getattr(mod, name, None)
+                if v is not None:
+                    return v
+            except Exception:
+                pass
+    return None
 
-Strategy = _find_strategy()
 
-# These will be resolved lazily since parse.py may define them after importing us
+# Strategy is needed at import time for class definition
+Strategy = _get('Strategy')
+if Strategy is None:
+    class Strategy:
+        def __init__(self, corrupted):
+            self.corrupted_image = corrupted
+
+# These will be resolved lazily since parse.py may define them AFTER importing us
 RegionRequest = None
 RegionAverageRequest = None
 SplitRequest = None
 Message = None
+_types_resolved = False
 
 def _ensure_types():
-    """Lazily resolve request/message types from sys.modules (called on first use)."""
-    global RegionRequest, RegionAverageRequest, SplitRequest, Message
-    if RegionAverageRequest is not None:
+    """Lazily resolve request/message types (called on first use)."""
+    global RegionRequest, RegionAverageRequest, SplitRequest, Message, _types_resolved
+    if _types_resolved:
         return
-    found = _find_in_modules('RegionRequest', 'RegionAverageRequest', 'SplitRequest', 'Message')
-    RegionRequest = found.get('RegionRequest')
-    RegionAverageRequest = found.get('RegionAverageRequest')
-    SplitRequest = found.get('SplitRequest')
-    Message = found.get('Message')
-    # Fallback Message
+    _types_resolved = True
+    RegionRequest = _get('RegionRequest')
+    RegionAverageRequest = _get('RegionAverageRequest')
+    SplitRequest = _get('SplitRequest')
+    Message = _get('Message')
     if Message is None:
-        class _FallbackMessage:
-            def __init__(self, **kwargs):
-                for k, v in kwargs.items():
+        class _Msg:
+            def __init__(self, **kw):
+                for k, v in kw.items():
                     setattr(self, k, v)
-        Message = _FallbackMessage
+        Message = _Msg
 
 
 class SubmissionStrategy(Strategy):
