@@ -1,21 +1,11 @@
 """
-CMIMC PIC – Image Recovery Strategy
-====================================
-Cooperative strategy with diffusion-based inpainting.
-
-Request budget  : ~20  (1 RegionAvg + 1 center-pixel per missing block)
-Response budget : up to 20 answers
-Reconstruction  : block-avg fill → Gauss-Seidel diffusion → clamp [0,1]
+CMIMC PIC – Image Recovery Strategy (Optimized v4)
 """
 import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Import game types – try the server module first, fall back to local stubs.
-# Adapt the first import line to match the actual server package name.
-# ---------------------------------------------------------------------------
 try:
     from strategy import Strategy
     from strategy import (
@@ -35,87 +25,124 @@ except ImportError:
 
 
 class SubmissionStrategy(Strategy):
-    # ------------------------------------------------------------------ init
+
     def __init__(self, corrupted: list[list[Optional[float]]]):
         super().__init__(corrupted)
-
-        self.n = 50
-        self.bs = 10          # block side length
-        self.nb = 5           # blocks per dimension
+        N = 50
+        BS = 10
+        self.n = N
+        self.bs = BS
         self.corrupted = corrupted
-        self.image = [row[:] for row in corrupted]
 
-        # ---------- classify blocks as visible / missing ----------
+        # Build image / mask arrays
+        img = [[0.0] * N for _ in range(N)]
+        mask = [[False] * N for _ in range(N)]
+        for r in range(N):
+            row = corrupted[r]
+            for c in range(N):
+                v = row[c]
+                if v is not None:
+                    img[r][c] = v
+                    mask[r][c] = True
+        self.image = img
+        self.mask = mask
+
+        # Classify blocks
         self.visible: set[tuple[int, int]] = set()
         self.missing: set[tuple[int, int]] = set()
-        for br in range(self.nb):
-            for bc in range(self.nb):
-                if corrupted[br * self.bs][bc * self.bs] is not None:
+        for br in range(5):
+            for bc in range(5):
+                if mask[br * BS][bc * BS]:
                     self.visible.add((br, bc))
                 else:
                     self.missing.add((br, bc))
 
-        # ---------- compute means for visible blocks ----------
+        # Block means for visible blocks
         self.vis_means: dict[tuple[int, int], float] = {}
         all_vals: list[float] = []
         for br, bc in self.visible:
-            vals = self._block_vals(br, bc)
-            if vals:
-                self.vis_means[(br, bc)] = sum(vals) / len(vals)
-                all_vals.extend(vals)
+            s = 0.0
+            for r in range(br * BS, br * BS + BS):
+                for c in range(bc * BS, bc * BS + BS):
+                    s += img[r][c]
+            self.vis_means[(br, bc)] = s / (BS * BS)
+            for r in range(br * BS, br * BS + BS):
+                for c in range(bc * BS, bc * BS + BS):
+                    all_vals.append(img[r][c])
 
         self.global_mean = sum(all_vals) / len(all_vals) if all_vals else 0.5
-
-        # ---------- detect if image is likely binary (circles / blobs) ----------
         self.is_binary = self._detect_binary(all_vals)
 
-        # will be populated during the protocol
         self.req_meta: list[tuple] = []
         self.recv_avgs: dict[tuple[int, int], float] = {}
-        self.extra_fixed: set[tuple[int, int]] = set()
+        self.recv_pixels: dict[tuple[int, int], float] = {}
+        self.recv_quad_avgs: dict[tuple, float] = {}
 
     # --------------------------------------------------------- make_requests
     def make_requests(self) -> list:
         reqs: list = []
         meta: list[tuple] = []
+        BS = self.bs
+        sm = sorted(self.missing)
 
-        sorted_missing = sorted(self.missing)
-
-        # 1) RegionAverageRequest for every missing block
-        for br, bc in sorted_missing:
-            r1, c1 = br * self.bs, bc * self.bs
+        # Pass 1: block averages (highest priority)
+        for br, bc in sm:
+            r1, c1 = br * BS, bc * BS
             reqs.append(RegionAverageRequest(r1, c1, r1 + 9, c1 + 9))
             meta.append(("avg", br, bc))
 
-        # 2) RegionRequest for the centre pixel of every missing block
-        for br, bc in sorted_missing:
-            tr = br * self.bs + self.bs // 2
-            tc = bc * self.bs + self.bs // 2
-            reqs.append(RegionRequest(tr, tc, tr, tc))
-            meta.append(("pix", br, bc, tr, tc))
+        # Pass 2: center pixel per block
+        for br, bc in sm:
+            r1, c1 = br * BS, bc * BS
+            reqs.append(RegionRequest(r1 + 5, c1 + 5, r1 + 5, c1 + 5))
+            meta.append(("pix", br, bc, r1 + 5, c1 + 5))
+
+        # Pass 3: 4-corner pixels per block
+        for br, bc in sm:
+            r1, c1 = br * BS, bc * BS
+            for dr, dc in [(2, 2), (2, 7), (7, 2), (7, 7)]:
+                reqs.append(RegionRequest(r1+dr, c1+dc, r1+dr, c1+dc))
+                meta.append(("pix", br, bc, r1+dr, c1+dc))
+
+        # Pass 4: edge centres
+        for br, bc in sm:
+            r1, c1 = br * BS, bc * BS
+            for pr, pc in [(r1, c1+5), (r1+9, c1+5), (r1+5, c1), (r1+5, c1+9)]:
+                reqs.append(RegionRequest(pr, pc, pr, pc))
+                meta.append(("pix", br, bc, pr, pc))
+
+        # Pass 5: quadrant averages
+        for br, bc in sm:
+            r1, c1 = br * BS, bc * BS
+            for qr1, qc1, qr2, qc2 in [
+                (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
+                (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9),
+            ]:
+                reqs.append(RegionAverageRequest(qr1, qc1, qr2, qc2))
+                meta.append(("qavg", br, bc, qr1, qc1, qr2, qc2))
+
+        # Pass 6: denser pixel grid
+        for br, bc in sm:
+            r1, c1 = br * BS, bc * BS
+            for dr, dc in [(1,5),(5,1),(5,8),(8,5),(3,3),(3,6),(6,3),(6,6)]:
+                reqs.append(RegionRequest(r1+dr, c1+dc, r1+dr, c1+dc))
+                meta.append(("pix", br, bc, r1+dr, c1+dc))
 
         self.req_meta = meta
-        logger.info(
-            "Sending %d requests (%d missing blocks)", len(reqs), len(self.missing)
-        )
         return reqs
 
     # ------------------------------------------------------ receive_requests
     def receive_requests(self, requests: list) -> list:
         responses: list = []
         answered = 0
-        max_answers = 20  # (20/50)^2 / 4 = 0.04 cost
-
         for req in requests:
-            if answered >= max_answers:
+            if answered >= 12:
                 responses.append(None)
                 continue
             resp = self._respond(req)
             responses.append(resp)
             if resp is not None:
                 answered += 1
-
-        logger.info("Answered %d / %d requests", answered, len(requests))
         return responses
 
     # ------------------------------------------------------ receive_messages
@@ -127,129 +154,316 @@ class SubmissionStrategy(Strategy):
             val = self._extract_value(msg)
             if val is None:
                 continue
+            val = max(0.0, min(1.0, val))
 
             if m[0] == "avg":
-                _, br, bc = m
-                self.recv_avgs[(br, bc)] = max(0.0, min(1.0, val))
-
+                self.recv_avgs[(m[1], m[2])] = val
+            elif m[0] == "qavg":
+                self.recv_quad_avgs[(m[3], m[4], m[5], m[6])] = val
             elif m[0] == "pix":
-                _, br, bc, tr, tc = m
-                clamped = max(0.0, min(1.0, val))
-                self.image[tr][tc] = clamped
-                self.extra_fixed.add((tr, tc))
+                row = getattr(msg, 'row', None)
+                col = getattr(msg, 'col', None)
+                if row is not None and col is not None:
+                    self.recv_pixels[(row, col)] = val
+                else:
+                    self.recv_pixels[(m[3], m[4])] = val
 
     # ---------------------------------------------------------------- recover
     def recover(self) -> list[list[Optional[float]]]:
-        n = self.n
+        N = self.n
+        BS = self.bs
+        img = self.image
+        mask = self.mask
 
-        # Phase 1 – seed missing pixels with block averages
+        # === Phase 0: Denoise visible blocks ===
+        if self.is_binary:
+            for r in range(N):
+                for c in range(N):
+                    if mask[r][c]:
+                        img[r][c] = 1.0 if img[r][c] >= 0.5 else 0.0
+
+        # === Phase 1: Place received pixel values ===
+        for (r, c), v in self.recv_pixels.items():
+            if 0 <= r < N and 0 <= c < N:
+                if self.is_binary:
+                    v = 1.0 if v >= 0.5 else 0.0
+                img[r][c] = v
+                mask[r][c] = True
+
+        # === Phase 2: Reconstruct missing blocks ===
+        if self.is_binary:
+            self._recover_binary(img, mask)
+        else:
+            self._recover_continuous(img, mask)
+
+        # Final clamp
+        for r in range(N):
+            for c in range(N):
+                v = img[r][c]
+                if v is None:
+                    img[r][c] = self.global_mean
+                elif v < 0.0:
+                    img[r][c] = 0.0
+                elif v > 1.0:
+                    img[r][c] = 1.0
+
+        return img
+
+    def _recover_binary(self, img, mask):
+        """Reconstruct missing blocks for binary images using diffusion + proportion threshold."""
+        N = self.n
+        BS = self.bs
+
+        # IDW initialization from boundary + received pixels
+        for br, bc in self.missing:
+            r1, c1 = br * BS, bc * BS
+            block_avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
+
+            refs: list[tuple[int, int, float]] = []
+            if br > 0 and (br - 1, bc) in self.visible:
+                for c in range(c1, c1 + BS):
+                    refs.append((r1 - 1, c, img[r1 - 1][c]))
+            if br < 4 and (br + 1, bc) in self.visible:
+                for c in range(c1, c1 + BS):
+                    refs.append((r1 + BS, c, img[r1 + BS][c]))
+            if bc > 0 and (br, bc - 1) in self.visible:
+                for r in range(r1, r1 + BS):
+                    refs.append((r, c1 - 1, img[r][c1 - 1]))
+            if bc < 4 and (br, bc + 1) in self.visible:
+                for r in range(r1, r1 + BS):
+                    refs.append((r, c1 + BS, img[r][c1 + BS]))
+
+            # Diagonal corners
+            for dbr, dbc in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                nbr, nbc = br + dbr, bc + dbc
+                if (nbr, nbc) in self.visible:
+                    cr = r1 + (BS if dbr == 1 else -1)
+                    cc = c1 + (BS if dbc == 1 else -1)
+                    if 0 <= cr < N and 0 <= cc < N:
+                        refs.append((cr, cc, img[cr][cc]))
+
+            for (pr, pc), pv in self.recv_pixels.items():
+                if r1 <= pr < r1 + BS and c1 <= pc < c1 + BS:
+                    refs.append((pr, pc, img[pr][pc]))
+
+            for r in range(r1, r1 + BS):
+                for c in range(c1, c1 + BS):
+                    if mask[r][c]:
+                        continue
+                    if refs:
+                        total_w, total_v = 0.0, 0.0
+                        for rr, rc, rv in refs:
+                            d2 = (r - rr) * (r - rr) + (c - rc) * (c - rc)
+                            if d2 == 0:
+                                total_w = 1.0; total_v = rv; break
+                            w = 1.0 / d2
+                            total_w += w; total_v += w * rv
+                        img[r][c] = total_v / total_w if total_w > 0 else block_avg
+                    else:
+                        img[r][c] = block_avg
+
+        # SOR diffusion
+        non_fixed: list[tuple[int, int]] = []
+        for r in range(N):
+            for c in range(N):
+                if not mask[r][c]:
+                    non_fixed.append((r, c))
+
+        omega = 1.75
+        for _ in range(200):
+            max_change = 0.0
+            for r, c in non_fixed:
+                total = 0.0; cnt = 0
+                if r > 0:     total += img[r-1][c]; cnt += 1
+                if r < N-1:   total += img[r+1][c]; cnt += 1
+                if c > 0:     total += img[r][c-1]; cnt += 1
+                if c < N-1:   total += img[r][c+1]; cnt += 1
+                if cnt > 0:
+                    old = img[r][c]
+                    img[r][c] = old + omega * (total / cnt - old)
+                    d = abs(img[r][c] - old)
+                    if d > max_change: max_change = d
+            if max_change < 1e-5:
+                break
+
+        # Proportion-matched thresholding per missing block
+        for br, bc in self.missing:
+            avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
+            r1, c1 = br * BS, bc * BS
+            pixels = []
+            for r in range(r1, r1 + BS):
+                for c in range(c1, c1 + BS):
+                    pixels.append((img[r][c], r, c))
+            count_1 = max(0, min(100, round(avg * 100)))
+            pixels.sort(key=lambda x: -x[0])
+            for i, (_, r, c) in enumerate(pixels):
+                img[r][c] = 1.0 if i < count_1 else 0.0
+
+
+
+    def _recover_continuous(self, img, mask):
+        """Reconstruct missing blocks for continuous images."""
+        N = self.n
+        BS = self.bs
+        quad_avgs = self.recv_quad_avgs
+
+        # Detect uniform missing blocks
+        uniform_blocks: set[tuple[int, int]] = set()
         for br, bc in self.missing:
             avg = self.recv_avgs.get((br, bc))
             if avg is None:
-                avg = self._neighbor_avg(br, bc)
-            for r in range(br * self.bs, br * self.bs + self.bs):
-                for c in range(bc * self.bs, bc * self.bs + self.bs):
-                    if self.image[r][c] is None:
-                        self.image[r][c] = avg
+                continue
+            r1, c1 = br * BS, bc * BS
+            block_pix = []
+            for (pr, pc), pv in self.recv_pixels.items():
+                if r1 <= pr < r1 + BS and c1 <= pc < c1 + BS:
+                    block_pix.append(pv)
+            if len(block_pix) >= 2:
+                if max(abs(p - avg) for p in block_pix) < 0.08:
+                    uniform_blocks.add((br, bc))
+                    for r in range(r1, r1 + BS):
+                        for c in range(c1, c1 + BS):
+                            if not mask[r][c]:
+                                img[r][c] = avg
+                                mask[r][c] = True
 
-        # Phase 2 – Gauss-Seidel diffusion inpainting
-        fixed = [[False] * n for _ in range(n)]
+        # IDW initialization for non-uniform missing blocks
+        for br, bc in self.missing:
+            if (br, bc) in uniform_blocks:
+                continue
+            r1, c1 = br * BS, bc * BS
+            block_avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
+
+            refs: list[tuple[int, int, float]] = []
+            if br > 0 and (br - 1, bc) in self.visible:
+                for c in range(c1, c1 + BS):
+                    refs.append((r1 - 1, c, img[r1 - 1][c]))
+            if br < 4 and (br + 1, bc) in self.visible:
+                for c in range(c1, c1 + BS):
+                    refs.append((r1 + BS, c, img[r1 + BS][c]))
+            if bc > 0 and (br, bc - 1) in self.visible:
+                for r in range(r1, r1 + BS):
+                    refs.append((r, c1 - 1, img[r][c1 - 1]))
+            if bc < 4 and (br, bc + 1) in self.visible:
+                for r in range(r1, r1 + BS):
+                    refs.append((r, c1 + BS, img[r][c1 + BS]))
+
+            for dbr, dbc in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                nbr, nbc = br + dbr, bc + dbc
+                if (nbr, nbc) in self.visible:
+                    cr = r1 + (BS if dbr == 1 else -1)
+                    cc = c1 + (BS if dbc == 1 else -1)
+                    if 0 <= cr < N and 0 <= cc < N:
+                        refs.append((cr, cc, img[cr][cc]))
+
+            for (pr, pc), pv in self.recv_pixels.items():
+                if r1 <= pr < r1 + BS and c1 <= pc < c1 + BS:
+                    refs.append((pr, pc, img[pr][pc]))
+
+            quads = [
+                (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
+                (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9),
+            ]
+            q_info = {q: quad_avgs[q] for q in quads if q in quad_avgs}
+
+            for r in range(r1, r1 + BS):
+                for c in range(c1, c1 + BS):
+                    if mask[r][c]:
+                        continue
+                    q_val = None
+                    for qr1, qc1, qr2, qc2 in quads:
+                        if qr1 <= r <= qr2 and qc1 <= c <= qc2:
+                            if (qr1, qc1, qr2, qc2) in q_info:
+                                q_val = q_info[(qr1, qc1, qr2, qc2)]
+                            break
+
+                    if refs:
+                        total_w, total_v = 0.0, 0.0
+                        for rr, rc, rv in refs:
+                            d2 = (r - rr) * (r - rr) + (c - rc) * (c - rc)
+                            if d2 == 0:
+                                total_w = 1.0; total_v = rv; break
+                            w = 1.0 / d2
+                            total_w += w; total_v += w * rv
+                        idw = total_v / total_w if total_w > 0 else block_avg
+                        img[r][c] = 0.5 * idw + 0.5 * q_val if q_val is not None else idw
+                    elif q_val is not None:
+                        img[r][c] = q_val
+                    else:
+                        img[r][c] = block_avg
+
+        # SOR diffusion for missing pixels
+        fixed = [[False] * N for _ in range(N)]
         non_fixed: list[tuple[int, int]] = []
-        for r in range(n):
-            for c in range(n):
-                if self.corrupted[r][c] is not None or (r, c) in self.extra_fixed:
+        for r in range(N):
+            for c in range(N):
+                if mask[r][c]:
                     fixed[r][c] = True
                 else:
                     non_fixed.append((r, c))
 
-        img = self.image  # alias for speed
-        for _ in range(50):
+        omega = 1.75
+        for _ in range(200):
+            max_change = 0.0
             for r, c in non_fixed:
-                total = 0.0
-                cnt = 0
-                if r > 0:
-                    v = img[r - 1][c]
-                    if v is not None:
-                        total += v; cnt += 1
-                if r < n - 1:
-                    v = img[r + 1][c]
-                    if v is not None:
-                        total += v; cnt += 1
-                if c > 0:
-                    v = img[r][c - 1]
-                    if v is not None:
-                        total += v; cnt += 1
-                if c < n - 1:
-                    v = img[r][c + 1]
-                    if v is not None:
-                        total += v; cnt += 1
+                total = 0.0; cnt = 0
+                if r > 0:     total += img[r-1][c]; cnt += 1
+                if r < N-1:   total += img[r+1][c]; cnt += 1
+                if c > 0:     total += img[r][c-1]; cnt += 1
+                if c < N-1:   total += img[r][c+1]; cnt += 1
                 if cnt > 0:
-                    img[r][c] = total / cnt
+                    old = img[r][c]
+                    img[r][c] = old + omega * (total / cnt - old)
+                    d = abs(img[r][c] - old)
+                    if d > max_change: max_change = d
+            if max_change < 1e-5:
+                break
 
-        # Phase 3 – binary thresholding (if detected) then clamp
-        if self.is_binary:
-            # Threshold visible pixels at 0.5
-            for r in range(n):
-                for c in range(n):
-                    v = img[r][c]
-                    if v is None:
-                        v = self.global_mean
-                    if fixed[r][c]:
-                        img[r][c] = 1.0 if v >= 0.5 else 0.0
+        # Enforce average constraint
+        for br, bc in self.missing:
+            if (br, bc) in uniform_blocks:
+                continue
+            avg = self.recv_avgs.get((br, bc))
+            if avg is None:
+                continue
+            r1, c1 = br * BS, bc * BS
 
-            # For missing blocks: use proportion-matching threshold.
-            # The block avg tells us what fraction should be 1.
-            for br, bc in self.missing:
-                avg = self.recv_avgs.get((br, bc))
-                if avg is None:
-                    avg = self._neighbor_avg(br, bc)
-                # Collect (diffused_value, r, c) for this block
-                pixels = []
-                for r in range(br * self.bs, br * self.bs + self.bs):
-                    for c in range(bc * self.bs, bc * self.bs + self.bs):
-                        pixels.append((img[r][c], r, c))
-                # Number of pixels that should be 1
-                count_1 = max(0, min(len(pixels), round(avg * len(pixels))))
-                # Sort by diffused value descending: highest become 1
-                pixels.sort(key=lambda x: -x[0])
-                for idx, (_, r, c) in enumerate(pixels):
-                    img[r][c] = 1.0 if idx < count_1 else 0.0
-        else:
-            for r in range(n):
-                for c in range(n):
-                    v = img[r][c]
-                    if v is None:
-                        v = self.global_mean
-                    img[r][c] = max(0.0, min(1.0, v))
+            for qr1, qc1, qr2, qc2 in [
+                (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
+                (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9),
+            ]:
+                key = (qr1, qc1, qr2, qc2)
+                if key in quad_avgs:
+                    q_sum, q_cnt = 0.0, 0
+                    for r in range(qr1, qr2 + 1):
+                        for c in range(qc1, qc2 + 1):
+                            q_sum += img[r][c]; q_cnt += 1
+                    if q_cnt > 0:
+                        shift = quad_avgs[key] - q_sum / q_cnt
+                        for r in range(qr1, qr2 + 1):
+                            for c in range(qc1, qc2 + 1):
+                                if not fixed[r][c]:
+                                    img[r][c] = max(0.0, min(1.0, img[r][c] + shift))
 
-        return img
+            b_sum = sum(img[r][c] for r in range(r1, r1+BS) for c in range(c1, c1+BS))
+            shift = avg - b_sum / (BS * BS)
+            if abs(shift) > 0.001:
+                for r in range(r1, r1 + BS):
+                    for c in range(c1, c1 + BS):
+                        if not fixed[r][c]:
+                            img[r][c] = max(0.0, min(1.0, img[r][c] + shift))
 
     # ============================================================== helpers
 
     @staticmethod
     def _detect_binary(all_vals: list[float]) -> bool:
-        """Check if visible pixel values cluster near 0 and 1 (binary image)."""
         if len(all_vals) < 100:
             return False
         near_0 = sum(1 for v in all_vals if v < 0.3)
         near_1 = sum(1 for v in all_vals if v > 0.7)
         mid = sum(1 for v in all_vals if 0.35 <= v <= 0.65)
         total = len(all_vals)
-        # binary if >65% are near extremes AND <20% are in the middle
-        return (near_0 + near_1) / total > 0.65 and mid / total < 0.20
-
-    def _find_threshold(self) -> float:
-        """For binary images, 0.5 is the natural separator."""
-        return 0.5
-
-    def _block_vals(self, br: int, bc: int) -> list[float]:
-        vals: list[float] = []
-        for r in range(br * self.bs, br * self.bs + self.bs):
-            for c in range(bc * self.bs, bc * self.bs + self.bs):
-                v = self.corrupted[r][c]
-                if v is not None:
-                    vals.append(v)
-        return vals
+        return (near_0 + near_1) / total > 0.60 and mid / total < 0.25
 
     def _neighbor_avg(self, br: int, bc: int) -> float:
         total, cnt = 0.0, 0
@@ -285,15 +499,15 @@ class SubmissionStrategy(Strategy):
         return Message(value=total / cnt)
 
     def _resp_region(self, req) -> Optional[Message]:
-        cr = (req.r1 + req.r2) / 2.0
-        cc = (req.c1 + req.c2) / 2.0
-        best: Optional[tuple[int, int, float]] = None
-        best_d = float("inf")
+        cr = (req.r1 + req.r2) * 0.5
+        cc = (req.c1 + req.c2) * 0.5
+        best = None
+        best_d = 1e18
         for r in range(max(0, req.r1), min(self.n, req.r2 + 1)):
             for c in range(max(0, req.c1), min(self.n, req.c2 + 1)):
                 v = self.corrupted[r][c]
                 if v is not None:
-                    d = (r - cr) ** 2 + (c - cc) ** 2
+                    d = (r - cr) * (r - cr) + (c - cc) * (c - cc)
                     if d < best_d:
                         best = (r, c, v)
                         best_d = d
@@ -302,16 +516,11 @@ class SubmissionStrategy(Strategy):
         return Message(row=best[0], col=best[1], value=best[2])
 
     def _resp_split(self, req) -> Optional[Message]:
-        v1 = self._px(req.r1, req.c1)
-        v2 = self._px(req.r2, req.c2)
+        v1 = self.corrupted[req.r1][req.c1] if 0 <= req.r1 < self.n and 0 <= req.c1 < self.n else None
+        v2 = self.corrupted[req.r2][req.c2] if 0 <= req.r2 < self.n and 0 <= req.c2 < self.n else None
         if v1 is None or v2 is None:
             return None
         return Message(value=1.0 if abs(v1 - v2) > 0.15 else 0.0)
-
-    def _px(self, r: int, c: int) -> Optional[float]:
-        if 0 <= r < self.n and 0 <= c < self.n:
-            return self.corrupted[r][c]
-        return None
 
     @staticmethod
     def _extract_value(msg) -> Optional[float]:
@@ -320,8 +529,7 @@ class SubmissionStrategy(Strategy):
         if isinstance(msg, (int, float)):
             return float(msg)
         for attr in ("value", "mean", "average", "val"):
-            if hasattr(msg, attr):
-                v = getattr(msg, attr)
-                if v is not None:
-                    return float(v)
+            v = getattr(msg, attr, None)
+            if v is not None:
+                return float(v)
         return None
