@@ -12,16 +12,23 @@ def _import_types():
     import sys, os, importlib
     names = ['Strategy', 'RegionRequest', 'RegionAverageRequest', 'SplitRequest', 'Message']
     found = {}
+    # Modules that could cause circular imports (they import us)
+    _skip = {'submission', 'parse', '__main__'}
 
     def _scan_module(mod):
         for name in names:
             if name not in found and hasattr(mod, name):
                 found[name] = getattr(mod, name)
 
-    # 1) Explicit guesses
-    for mod_name in ['strategy', 'game', 'game_types', 'parse', 'models', 'base', 'common', 'lib', 'types']:
+    # 1) Explicit guesses (NO parse — it imports us!)
+    for mod_name in ['strategy', 'game', 'game_types', 'models', 'base', 'common',
+                     'lib', 'types', 'utils', 'config', 'pic', 'image', 'core',
+                     'helpers', 'server', 'engine', 'shared', 'protocol', 'api',
+                     'definitions', 'interfaces', 'data_types', 'request', 'message']:
         if len(found) == len(names):
             break
+        if mod_name in _skip:
+            continue
         try:
             _scan_module(__import__(mod_name))
         except Exception:
@@ -36,7 +43,7 @@ def _import_types():
             if len(found) == len(names):
                 break
 
-    # 3) Try importing every .py file next to us or in /app/
+    # 3) Try importing every .py file next to us or in /app/ (skip dangerous ones)
     if len(found) < len(names):
         dirs_to_scan = set()
         dirs_to_scan.add(os.path.dirname(os.path.abspath(__file__)))
@@ -45,18 +52,21 @@ def _import_types():
         for d in dirs_to_scan:
             if not os.path.isdir(d):
                 continue
-            for fn in os.listdir(d):
-                if fn.endswith('.py') and fn != os.path.basename(__file__):
-                    mod_name = fn[:-3]
-                    if mod_name in sys.modules:
-                        _scan_module(sys.modules[mod_name])
-                    else:
-                        try:
-                            _scan_module(importlib.import_module(mod_name))
-                        except Exception:
-                            pass
-                    if len(found) == len(names):
-                        break
+            for fn in sorted(os.listdir(d)):
+                if not fn.endswith('.py'):
+                    continue
+                mod_name = fn[:-3]
+                if mod_name in _skip:
+                    continue
+                if mod_name in sys.modules:
+                    _scan_module(sys.modules[mod_name])
+                else:
+                    try:
+                        _scan_module(importlib.import_module(mod_name))
+                    except Exception:
+                        pass
+                if len(found) == len(names):
+                    break
 
     # 4) Fallback: if Strategy not found, use object so the class can still be defined
     if 'Strategy' not in found:
