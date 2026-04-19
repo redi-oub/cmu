@@ -9,19 +9,69 @@ logger = logging.getLogger(__name__)
 
 def _import_types():
     """Robustly import Strategy and request/message types from whatever module the server provides."""
+    import sys, os, importlib
     names = ['Strategy', 'RegionRequest', 'RegionAverageRequest', 'SplitRequest', 'Message']
-    modules_to_try = ['strategy', 'game', 'game_types']
     found = {}
-    for mod_name in modules_to_try:
-        try:
-            mod = __import__(mod_name)
-        except ImportError:
-            continue
+
+    def _scan_module(mod):
         for name in names:
             if name not in found and hasattr(mod, name):
                 found[name] = getattr(mod, name)
+
+    # 1) Explicit guesses
+    for mod_name in ['strategy', 'game', 'game_types', 'parse', 'models', 'base', 'common', 'lib', 'types']:
         if len(found) == len(names):
             break
+        try:
+            _scan_module(__import__(mod_name))
+        except Exception:
+            pass
+
+    # 2) Search everything already loaded in sys.modules
+    if len(found) < len(names):
+        for mod in list(sys.modules.values()):
+            if mod is None:
+                continue
+            _scan_module(mod)
+            if len(found) == len(names):
+                break
+
+    # 3) Try importing every .py file next to us or in /app/
+    if len(found) < len(names):
+        dirs_to_scan = set()
+        dirs_to_scan.add(os.path.dirname(os.path.abspath(__file__)))
+        dirs_to_scan.add('/app')
+        dirs_to_scan.add(os.getcwd())
+        for d in dirs_to_scan:
+            if not os.path.isdir(d):
+                continue
+            for fn in os.listdir(d):
+                if fn.endswith('.py') and fn != os.path.basename(__file__):
+                    mod_name = fn[:-3]
+                    if mod_name in sys.modules:
+                        _scan_module(sys.modules[mod_name])
+                    else:
+                        try:
+                            _scan_module(importlib.import_module(mod_name))
+                        except Exception:
+                            pass
+                    if len(found) == len(names):
+                        break
+
+    # 4) Fallback: if Strategy not found, use object so the class can still be defined
+    if 'Strategy' not in found:
+        class _FallbackStrategy:
+            def __init__(self, corrupted): self.corrupted_image = corrupted
+        found['Strategy'] = _FallbackStrategy
+
+    # 5) Fallback Message if not found
+    if 'Message' not in found:
+        class _FallbackMessage:
+            def __init__(self, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+        found['Message'] = _FallbackMessage
+
     return tuple(found.get(n) for n in names)
 
 Strategy, RegionRequest, RegionAverageRequest, SplitRequest, Message = _import_types()
@@ -482,12 +532,23 @@ class SubmissionStrategy(Strategy):
         return total / cnt if cnt > 0 else self.global_mean
 
     def _respond(self, req) -> Optional[Message]:
-        if isinstance(req, RegionAverageRequest):
+        if RegionAverageRequest is not None and isinstance(req, RegionAverageRequest):
             return self._resp_avg(req)
-        if isinstance(req, RegionRequest):
+        if RegionRequest is not None and isinstance(req, RegionRequest):
             return self._resp_region(req)
-        if isinstance(req, SplitRequest):
+        if SplitRequest is not None and isinstance(req, SplitRequest):
             return self._resp_split(req)
+        # Fallback: detect request type by attribute names
+        cls_name = type(req).__name__
+        if 'Average' in cls_name or 'average' in cls_name:
+            return self._resp_avg(req)
+        if 'Split' in cls_name or 'split' in cls_name:
+            return self._resp_split(req)
+        if 'Region' in cls_name or 'region' in cls_name:
+            return self._resp_region(req)
+        # Last resort: if it has r1/c1/r2/c2, treat as region request
+        if hasattr(req, 'r1') and hasattr(req, 'c1'):
+            return self._resp_region(req)
         return None
 
     def _resp_avg(self, req) -> Optional[Message]:
