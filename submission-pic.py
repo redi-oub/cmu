@@ -44,8 +44,10 @@ class SubmissionStrategy(Strategy):
         self.corrupted = corrupted
         self.missing = set()
         self.vis_means = {}
+        self.is_binary = False
         self.req_order = []
         self.recv_avgs = {}
+        all_vals = []
         for br in range(5):
             for bc in range(5):
                 if corrupted[br * 10][bc * 10] is None:
@@ -59,8 +61,14 @@ class SubmissionStrategy(Strategy):
                             if v is not None:
                                 s += v
                                 cnt += 1
+                                all_vals.append(v)
                     if cnt > 0:
                         self.vis_means[(br, bc)] = s / cnt
+        if all_vals:
+            near_0 = sum(1 for v in all_vals if v < 0.15)
+            near_1 = sum(1 for v in all_vals if v > 0.85)
+            nn = len(all_vals)
+            self.is_binary = (near_0 + near_1) / nn > 0.85
 
     def make_requests(self):
         try:
@@ -132,7 +140,10 @@ class SubmissionStrategy(Strategy):
             for c in range(N):
                 v = self.corrupted[r][c]
                 if v is not None:
-                    img[r][c] = float(v)
+                    if self.is_binary:
+                        img[r][c] = 1.0 if v >= 0.5 else 0.0
+                    else:
+                        img[r][c] = float(v)
 
         for br, bc in self.missing:
             r1, c1 = br * BS, bc * BS
@@ -204,6 +215,20 @@ class SubmissionStrategy(Strategy):
                     for r in range(r1, r1 + BS):
                         for c in range(c1, c1 + BS):
                             img[r][c] = max(0.0, min(1.0, img[r][c] + shift))
+
+        # Binary thresholding pass
+        if self.is_binary:
+            for br, bc in self.missing:
+                r1, c1 = br * BS, bc * BS
+                avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
+                count_1 = max(0, min(BS*BS, round(avg * BS * BS)))
+                pixels = []
+                for r in range(r1, r1 + BS):
+                    for c in range(c1, c1 + BS):
+                        pixels.append((img[r][c], r, c))
+                pixels.sort(key=lambda x: -x[0])
+                for i, (_, r, c) in enumerate(pixels):
+                    img[r][c] = 1.0 if i < count_1 else 0.0
 
         result = []
         for r in range(N):
