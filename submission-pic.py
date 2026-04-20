@@ -25,10 +25,11 @@ if Strategy is None:
 # Lazy types - resolved once when make_requests is first called
 RegionRequest = None
 RegionAverageRequest = None
+Message = None
 _types_resolved = False
 
 def _ensure_types():
-    global RegionRequest, RegionAverageRequest, _types_resolved
+    global RegionRequest, RegionAverageRequest, Message, _types_resolved
     if _types_resolved:
         return
     _types_resolved = True
@@ -36,6 +37,7 @@ def _ensure_types():
     if _main:
         RegionRequest = getattr(_main, 'RegionRequest', None)
         RegionAverageRequest = getattr(_main, 'RegionAverageRequest', None)
+        Message = getattr(_main, 'Message', None)
 
 
 class SubmissionStrategy(Strategy):
@@ -111,7 +113,40 @@ class SubmissionStrategy(Strategy):
             return []
 
     def receive_requests(self, requests):
-        return [None] * len(requests)
+        try:
+            _ensure_types()
+            if Message is None:
+                return [None] * len(requests)
+            responses = [None] * len(requests)
+            n_ans = 0
+            for i, req in enumerate(requests):
+                if n_ans >= 40:
+                    break
+                r1 = getattr(req, 'r1', None)
+                c1 = getattr(req, 'c1', None)
+                r2 = getattr(req, 'r2', None)
+                c2 = getattr(req, 'c2', None)
+                if r1 is None or c1 is None or r2 is None or c2 is None:
+                    continue
+                if r1 < 0 or c1 < 0 or r2 >= 50 or c2 >= 50:
+                    continue
+                s, cnt, ok = 0.0, 0, True
+                for r in range(r1, r2 + 1):
+                    for c in range(c1, c2 + 1):
+                        v = self.corrupted[r][c]
+                        if v is None:
+                            ok = False
+                            break
+                        s += v
+                        cnt += 1
+                    if not ok:
+                        break
+                if ok and cnt > 0:
+                    responses[i] = Message(value=s / cnt)
+                    n_ans += 1
+            return responses
+        except Exception:
+            return [None] * len(requests)
 
     def receive_messages(self, messages):
         try:
@@ -155,182 +190,121 @@ class SubmissionStrategy(Strategy):
         N = 50
         BS = 10
         img = [[0.0] * N for _ in range(N)]
-        mask = [[False] * N for _ in range(N)]
+
+        # Fill visible pixels (denoise binary images)
         for r in range(N):
             for c in range(N):
                 v = self.corrupted[r][c]
                 if v is not None:
-                    img[r][c] = float(v)
-                    mask[r][c] = True
+                    if self.is_binary:
+                        img[r][c] = 1.0 if v >= 0.5 else 0.0
+                    else:
+                        img[r][c] = float(v)
+                else:
+                    # Initialize missing pixels with block average
+                    br, bc = r // BS, c // BS
+                    if (br, bc) in self.missing:
+                        img[r][c] = self.recv_avgs.get((br, bc),
+                                                        self._neighbor_avg(br, bc))
+                    else:
+                        img[r][c] = self.vis_means.get((br, bc), 0.5)
 
-        # Sort missing blocks: most visible neighbors first (cascade fill)
-        available = set()
-        for br in range(5):
-            for bc in range(5):
-                if (br, bc) not in self.missing:
-                    available.add((br, bc))
+        # Collect ALL missing pixel coordinates
+        missing_px = []
+        for r in range(N):
+            for c in range(N):
+                if self.corrupted[r][c] is None:
+                    missing_px.append((r, c))
 
-        remaining = list(self.missing)
+        # Laplacian relaxation (harmonic inpainting)
+        for _ in range(80):
+            for r, c in missing_px:
+                s, cnt = 0.0, 0
+                if r > 0:    s += img[r-1][c]; cnt += 1
+                if r < 49:   s += img[r+1][c]; cnt += 1
+                if c > 0:    s += img[r][c-1]; cnt += 1
+                if c < 49:   s += img[r][c+1]; cnt += 1
+                if cnt > 0:
+                    img[r][c] = s / cnt
 
-        def _count_avail(br, bc):
-            n = 0
-            for dbr in (-1, 0, 1):
-                for dbc in (-1, 0, 1):
-                    if dbr == 0 and dbc == 0:
-                        continue
-                    if (br + dbr, bc + dbc) in available:
-                        n += 1
-            return n
-
-        # Two full passes for refinement
-        for pass_num in range(2):
-            if pass_num == 0:
-                order = sorted(remaining, key=lambda b: -_count_avail(b[0], b[1]))
-            else:
-                order = sorted(remaining, key=lambda b: _count_avail(b[0], b[1]))
-
-            for br, bc in order:
-                r1, c1 = br * BS, bc * BS
-                block_avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
-
-                # Gather border refs from all adjacent available blocks
-                refs = []
-                for dbr in (-1, 0, 1):
-                    for dbc in (-1, 0, 1):
-                        if dbr == 0 and dbc == 0:
-                            continue
-                        nbr, nbc = br + dbr, bc + dbc
-                        if not (0 <= nbr < 5 and 0 <= nbc < 5):
-                            continue
-                        if (nbr, nbc) not in available:
-                            continue
-                        # Cardinal neighbors: use full edge (2 rows/cols deep)
-                        if dbr == 0 or dbc == 0:
-                            if dbr == -1:  # block above
-                                for d in range(2):
-                                    rr = r1 - 1 - d
-                                    if 0 <= rr < N:
-                                        for cc in range(c1, c1 + BS):
-                                            refs.append((rr, cc, img[rr][cc]))
-                            elif dbr == 1:  # block below
-                                for d in range(2):
-                                    rr = r1 + BS + d
-                                    if 0 <= rr < N:
-                                        for cc in range(c1, c1 + BS):
-                                            refs.append((rr, cc, img[rr][cc]))
-                            elif dbc == -1:  # block left
-                                for d in range(2):
-                                    cc = c1 - 1 - d
-                                    if 0 <= cc < N:
-                                        for rr in range(r1, r1 + BS):
-                                            refs.append((rr, cc, img[rr][cc]))
-                            elif dbc == 1:  # block right
-                                for d in range(2):
-                                    cc = c1 + BS + d
-                                    if 0 <= cc < N:
-                                        for rr in range(r1, r1 + BS):
-                                            refs.append((rr, cc, img[rr][cc]))
-                        else:
-                            # Diagonal: use corner 2x2
-                            for dr2 in range(2):
-                                for dc2 in range(2):
-                                    rr = (r1 - 1 - dr2) if dbr == -1 else (r1 + BS + dr2)
-                                    cc = (c1 - 1 - dc2) if dbc == -1 else (c1 + BS + dc2)
-                                    if 0 <= rr < N and 0 <= cc < N:
-                                        refs.append((rr, cc, img[rr][cc]))
-
-                # Quadrant averages
-                quads = [
-                    (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
-                    (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9)]
-                q_info = {}
-                for q in quads:
-                    v = self.recv_avgs.get(q)
-                    if v is not None:
-                        q_info[q] = v
-
-                # Row and column strip averages
-                row_avgs = {}
-                col_avgs = {}
-                for dr in range(BS):
-                    v = self.recv_rows.get((br, bc, dr))
-                    if v is not None:
-                        row_avgs[dr] = v
-                for dc in range(BS):
-                    v = self.recv_cols.get((br, bc, dc))
-                    if v is not None:
-                        col_avgs[dc] = v
-
+        # Block average shift correction
+        for br, bc in self.missing:
+            r1, c1 = br * BS, bc * BS
+            avg = self.recv_avgs.get((br, bc))
+            if avg is not None:
+                bsum = sum(img[rr][cc]
+                           for rr in range(r1, r1+BS)
+                           for cc in range(c1, c1+BS))
+                shift = avg - bsum / (BS * BS)
                 for r in range(r1, r1 + BS):
                     for c in range(c1, c1 + BS):
-                        dr = r - r1
-                        dc = c - c1
+                        img[r][c] = max(0.0, min(1.0, img[r][c] + shift))
 
-                        # Row+col additive model
-                        rc_val = None
-                        if dr in row_avgs and dc in col_avgs:
-                            rc_val = row_avgs[dr] + col_avgs[dc] - block_avg
-                        elif dr in row_avgs:
-                            rc_val = row_avgs[dr]
-                        elif dc in col_avgs:
-                            rc_val = col_avgs[dc]
+        # Row/col average refinement when available
+        for br, bc in self.missing:
+            r1, c1 = br * BS, bc * BS
+            for dr in range(BS):
+                ravg = self.recv_rows.get((br, bc, dr))
+                if ravg is not None:
+                    cur = sum(img[r1+dr][c1+dc] for dc in range(BS)) / BS
+                    shift = ravg - cur
+                    for dc in range(BS):
+                        img[r1+dr][c1+dc] = max(0.0, min(1.0,
+                            img[r1+dr][c1+dc] + shift))
+            for dc in range(BS):
+                cavg = self.recv_cols.get((br, bc, dc))
+                if cavg is not None:
+                    cur = sum(img[r1+dr][c1+dc] for dr in range(BS)) / BS
+                    shift = cavg - cur
+                    for dr in range(BS):
+                        img[r1+dr][c1+dc] = max(0.0, min(1.0,
+                            img[r1+dr][c1+dc] + shift))
 
-                        q_val = None
-                        for qr1, qc1, qr2, qc2 in quads:
-                            if qr1 <= r <= qr2 and qc1 <= c <= qc2 and (qr1, qc1, qr2, qc2) in q_info:
-                                q_val = q_info[(qr1, qc1, qr2, qc2)]
-                                break
+        # Quick smoothing pass to fix discontinuities from shifting
+        for _ in range(10):
+            for r, c in missing_px:
+                s, cnt = 0.0, 0
+                if r > 0:    s += img[r-1][c]; cnt += 1
+                if r < 49:   s += img[r+1][c]; cnt += 1
+                if c > 0:    s += img[r][c-1]; cnt += 1
+                if c < 49:   s += img[r][c+1]; cnt += 1
+                if cnt > 0:
+                    img[r][c] = s / cnt
 
-                        if refs:
-                            tw, tv = 0.0, 0.0
-                            for rr, rc2, rv in refs:
-                                d2 = (r - rr) ** 2 + (c - rc2) ** 2
-                                if d2 == 0:
-                                    tw, tv = 1.0, rv
-                                    break
-                                w = 1.0 / (d2 * d2 ** 0.5)  # 1/d^3
-                                tw += w
-                                tv += w * rv
-                            idw = tv / tw if tw > 0 else block_avg
-                        else:
-                            idw = block_avg
+        # Re-apply block average after smoothing
+        for br, bc in self.missing:
+            r1, c1 = br * BS, bc * BS
+            avg = self.recv_avgs.get((br, bc))
+            if avg is not None:
+                bsum = sum(img[rr][cc]
+                           for rr in range(r1, r1+BS)
+                           for cc in range(c1, c1+BS))
+                shift = avg - bsum / (BS * BS)
+                for r in range(r1, r1 + BS):
+                    for c in range(c1, c1 + BS):
+                        img[r][c] = max(0.0, min(1.0, img[r][c] + shift))
 
-                        # Combine available signals
-                        if rc_val is not None:
-                            base = max(0.0, min(1.0, rc_val))
-                            img[r][c] = 0.6 * base + 0.4 * idw
-                        elif q_val is not None:
-                            img[r][c] = 0.4 * idw + 0.6 * q_val
-                        else:
-                            img[r][c] = idw
-
-                # Shift to match known block average
-                avg = self.recv_avgs.get((br, bc))
-                if avg is not None:
-                    bsum = sum(img[rr][cc] for rr in range(r1, r1+BS) for cc in range(c1, c1+BS))
-                    shift = avg - bsum / (BS * BS)
-                    if abs(shift) > 0.001:
-                        for r in range(r1, r1 + BS):
-                            for c in range(c1, c1 + BS):
-                                img[r][c] = max(0.0, min(1.0, img[r][c] + shift))
-
-                # Mark this block as available for subsequent blocks
-                if pass_num == 0:
-                    available.add((br, bc))
-
-        # Binary thresholding pass
+        # Binary: per-quadrant thresholding
         if self.is_binary:
             for br, bc in self.missing:
                 r1, c1 = br * BS, bc * BS
-                avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
-                count_1 = max(0, min(BS*BS, round(avg * BS * BS)))
-                pixels = []
-                for r in range(r1, r1 + BS):
-                    for c in range(c1, c1 + BS):
-                        pixels.append((img[r][c], r, c))
-                pixels.sort(key=lambda x: -x[0])
-                for i, (_, r, c) in enumerate(pixels):
-                    img[r][c] = 1.0 if i < count_1 else 0.0
+                block_avg = self.recv_avgs.get((br, bc),
+                                                self._neighbor_avg(br, bc))
+                quads = [
+                    (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
+                    (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9)]
+                for qr1, qc1, qr2, qc2 in quads:
+                    qavg = self.recv_avgs.get((qr1, qc1, qr2, qc2),
+                                               block_avg)
+                    qsize = (qr2 - qr1 + 1) * (qc2 - qc1 + 1)
+                    count_1 = max(0, min(qsize, round(qavg * qsize)))
+                    pixels = []
+                    for r in range(qr1, qr2 + 1):
+                        for c in range(qc1, qc2 + 1):
+                            pixels.append((img[r][c], r, c))
+                    pixels.sort(key=lambda x: -x[0])
+                    for idx, (_, r, c) in enumerate(pixels):
+                        img[r][c] = 1.0 if idx < count_1 else 0.0
 
         result = []
         for r in range(N):
