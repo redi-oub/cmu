@@ -47,7 +47,8 @@ class SubmissionStrategy(Strategy):
         self.is_binary = False
         self.req_order = []
         self.recv_avgs = {}
-        self.recv_pixels = {}
+        self.recv_rows = {}
+        self.recv_cols = {}
         all_vals = []
         for br in range(5):
             for bc in range(5):
@@ -92,17 +93,18 @@ class SubmissionStrategy(Strategy):
                     (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9)]:
                     reqs.append(RegionAverageRequest(qr1, qc1, qr2, qc2))
                     order.append(('qavg', br, bc, qr1, qc1, qr2, qc2))
-            # Pixel samples via RegionRequest (1x1)
-            if RegionRequest is not None:
-                for br, bc in sm:
-                    r1, c1 = br * 10, bc * 10
-                    for dr, dc in [(5,5),(2,2),(2,7),(7,2),(7,7),
-                                   (0,5),(9,5),(5,0),(5,9),
-                                   (1,1),(1,8),(8,1),(8,8),
-                                   (3,5),(5,3),(5,6),(6,5)]:
-                        pr, pc = r1+dr, c1+dc
-                        reqs.append(RegionRequest(pr, pc, pr, pc))
-                        order.append(('pix', br, bc, pr, pc))
+            # Row strip averages (1 row x 10 cols each)
+            for br, bc in sm:
+                r1, c1 = br * 10, bc * 10
+                for dr in range(10):
+                    reqs.append(RegionAverageRequest(r1+dr, c1, r1+dr, c1+9))
+                    order.append(('ravg', br, bc, dr))
+            # Column strip averages (10 rows x 1 col each)
+            for br, bc in sm:
+                r1, c1 = br * 10, bc * 10
+                for dc in range(10):
+                    reqs.append(RegionAverageRequest(r1, c1+dc, r1+9, c1+dc))
+                    order.append(('cavg', br, bc, dc))
             self.req_order = order
             return reqs
         except Exception:
@@ -125,8 +127,11 @@ class SubmissionStrategy(Strategy):
                     self.recv_avgs[(m[1], m[2])] = val
                 elif m[0] == 'qavg':
                     self.recv_avgs[(m[3], m[4], m[5], m[6])] = val
-                elif m[0] == 'pix':
-                    self.recv_pixels[(m[3], m[4])] = val
+                elif m[0] == 'ravg':
+                    self.recv_rows[(m[1], m[2], m[3])] = val
+                elif m[0] == 'cavg':
+                    self.recv_cols[(m[1], m[2], m[3])] = val
+
         except Exception:
             pass
 
@@ -161,15 +166,6 @@ class SubmissionStrategy(Strategy):
                         img[r][c] = float(v)
                     mask[r][c] = True
 
-        # Apply received pixels as known points
-        for (pr, pc), pv in self.recv_pixels.items():
-            if 0 <= pr < N and 0 <= pc < N:
-                if self.is_binary:
-                    img[pr][pc] = 1.0 if pv >= 0.5 else 0.0
-                else:
-                    img[pr][pc] = max(0.0, min(1.0, pv))
-                mask[pr][pc] = True
-
         for br, bc in self.missing:
             r1, c1 = br * BS, bc * BS
             block_avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
@@ -195,11 +191,6 @@ class SubmissionStrategy(Strategy):
                     cc2 = c1 + (BS if dbc == 1 else -1)
                     if 0 <= cr2 < N and 0 <= cc2 < N:
                         refs.append((cr2, cc2, img[cr2][cc2]))
-            # Add received pixels inside this block
-            for (pr, pc), pv in self.recv_pixels.items():
-                if r1 <= pr < r1 + BS and c1 <= pc < c1 + BS:
-                    refs.append((pr, pc, img[pr][pc]))
-
             quads = [
                 (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
                 (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9)]
@@ -209,19 +200,60 @@ class SubmissionStrategy(Strategy):
                 if v is not None:
                     q_info[q] = v
 
+            # Collect row and column averages for this block
+            row_avgs = {}
+            col_avgs = {}
+            for dr in range(BS):
+                v = self.recv_rows.get((br, bc, dr))
+                if v is not None:
+                    row_avgs[dr] = v
+            for dc in range(BS):
+                v = self.recv_cols.get((br, bc, dc))
+                if v is not None:
+                    col_avgs[dc] = v
+
             for r in range(r1, r1 + BS):
                 for c in range(c1, c1 + BS):
                     if mask[r][c]:
                         continue
+                    dr = r - r1
+                    dc = c - c1
+
+                    # Row+col additive model
+                    rc_val = None
+                    if dr in row_avgs and dc in col_avgs:
+                        rc_val = row_avgs[dr] + col_avgs[dc] - block_avg
+                    elif dr in row_avgs:
+                        rc_val = row_avgs[dr]
+                    elif dc in col_avgs:
+                        rc_val = col_avgs[dc]
+
                     q_val = None
                     for qr1, qc1, qr2, qc2 in quads:
                         if qr1 <= r <= qr2 and qc1 <= c <= qc2 and (qr1, qc1, qr2, qc2) in q_info:
                             q_val = q_info[(qr1, qc1, qr2, qc2)]
                             break
-                    if refs:
+
+                    if rc_val is not None:
+                        base = max(0.0, min(1.0, rc_val))
+                        if refs:
+                            tw, tv = 0.0, 0.0
+                            for rr, rc2, rv in refs:
+                                d2 = (r - rr) ** 2 + (c - rc2) ** 2
+                                if d2 == 0:
+                                    tw, tv = 1.0, rv
+                                    break
+                                w = 1.0 / d2
+                                tw += w
+                                tv += w * rv
+                            idw = tv / tw if tw > 0 else block_avg
+                            img[r][c] = 0.7 * base + 0.3 * idw
+                        else:
+                            img[r][c] = base
+                    elif refs:
                         tw, tv = 0.0, 0.0
-                        for rr, rc, rv in refs:
-                            d2 = (r - rr) ** 2 + (c - rc) ** 2
+                        for rr, rc2, rv in refs:
+                            d2 = (r - rr) ** 2 + (c - rc2) ** 2
                             if d2 == 0:
                                 tw, tv = 1.0, rv
                                 break
