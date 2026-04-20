@@ -47,6 +47,7 @@ class SubmissionStrategy(Strategy):
         self.is_binary = False
         self.req_order = []
         self.recv_avgs = {}
+        self.recv_pixels = {}
         all_vals = []
         for br in range(5):
             for bc in range(5):
@@ -91,6 +92,17 @@ class SubmissionStrategy(Strategy):
                     (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9)]:
                     reqs.append(RegionAverageRequest(qr1, qc1, qr2, qc2))
                     order.append(('qavg', br, bc, qr1, qc1, qr2, qc2))
+            # Pixel samples via RegionRequest (1x1)
+            if RegionRequest is not None:
+                for br, bc in sm:
+                    r1, c1 = br * 10, bc * 10
+                    for dr, dc in [(5,5),(2,2),(2,7),(7,2),(7,7),
+                                   (0,5),(9,5),(5,0),(5,9),
+                                   (1,1),(1,8),(8,1),(8,8),
+                                   (3,5),(5,3),(5,6),(6,5)]:
+                        pr, pc = r1+dr, c1+dc
+                        reqs.append(RegionRequest(pr, pc, pr, pc))
+                        order.append(('pix', br, bc, pr, pc))
             self.req_order = order
             return reqs
         except Exception:
@@ -113,6 +125,8 @@ class SubmissionStrategy(Strategy):
                     self.recv_avgs[(m[1], m[2])] = val
                 elif m[0] == 'qavg':
                     self.recv_avgs[(m[3], m[4], m[5], m[6])] = val
+                elif m[0] == 'pix':
+                    self.recv_pixels[(m[3], m[4])] = val
         except Exception:
             pass
 
@@ -136,6 +150,7 @@ class SubmissionStrategy(Strategy):
         N = 50
         BS = 10
         img = [[0.0] * N for _ in range(N)]
+        mask = [[False] * N for _ in range(N)]
         for r in range(N):
             for c in range(N):
                 v = self.corrupted[r][c]
@@ -144,6 +159,16 @@ class SubmissionStrategy(Strategy):
                         img[r][c] = 1.0 if v >= 0.5 else 0.0
                     else:
                         img[r][c] = float(v)
+                    mask[r][c] = True
+
+        # Apply received pixels as known points
+        for (pr, pc), pv in self.recv_pixels.items():
+            if 0 <= pr < N and 0 <= pc < N:
+                if self.is_binary:
+                    img[pr][pc] = 1.0 if pv >= 0.5 else 0.0
+                else:
+                    img[pr][pc] = max(0.0, min(1.0, pv))
+                mask[pr][pc] = True
 
         for br, bc in self.missing:
             r1, c1 = br * BS, bc * BS
@@ -170,6 +195,10 @@ class SubmissionStrategy(Strategy):
                     cc2 = c1 + (BS if dbc == 1 else -1)
                     if 0 <= cr2 < N and 0 <= cc2 < N:
                         refs.append((cr2, cc2, img[cr2][cc2]))
+            # Add received pixels inside this block
+            for (pr, pc), pv in self.recv_pixels.items():
+                if r1 <= pr < r1 + BS and c1 <= pc < c1 + BS:
+                    refs.append((pr, pc, img[pr][pc]))
 
             quads = [
                 (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
@@ -182,6 +211,8 @@ class SubmissionStrategy(Strategy):
 
             for r in range(r1, r1 + BS):
                 for c in range(c1, c1 + BS):
+                    if mask[r][c]:
+                        continue
                     q_val = None
                     for qr1, qc1, qr2, qc2 in quads:
                         if qr1 <= r <= qr2 and qc1 <= c <= qc2 and (qr1, qc1, qr2, qc2) in q_info:
