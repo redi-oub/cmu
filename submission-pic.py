@@ -1,4 +1,4 @@
-"""+ vis_means + neighbor avg + quadrant avgs + opponent responses."""
+"""vis_means + quadrant avgs + IDW recovery (safe)."""
 import sys
 
 # Try every possible way to get Strategy
@@ -104,6 +104,22 @@ class SubmissionStrategy(Strategy):
             pass
 
     def recover(self):
+        try:
+            return self._do_recover()
+        except Exception:
+            pass
+        # Fallback: flat
+        N = 50
+        result = []
+        for r in range(N):
+            row = []
+            for c in range(N):
+                v = self.corrupted[r][c]
+                row.append(float(v) if v is not None else 0.5)
+            result.append(row)
+        return result
+
+    def _do_recover(self):
         N = 50
         BS = 10
         img = [[0.0] * N for _ in range(N)]
@@ -117,7 +133,6 @@ class SubmissionStrategy(Strategy):
             r1, c1 = br * BS, bc * BS
             block_avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
 
-            # Collect border reference pixels from visible neighbors
             refs = []
             vis = self.vis_means
             if br > 0 and (br - 1, bc) in vis:
@@ -132,16 +147,14 @@ class SubmissionStrategy(Strategy):
             if bc < 4 and (br, bc + 1) in vis:
                 for r in range(r1, r1 + BS):
                     refs.append((r, c1 + BS, img[r][c1 + BS]))
-            # Diagonal corners
             for dbr, dbc in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
                 nbr, nbc = br + dbr, bc + dbc
                 if (nbr, nbc) in vis:
-                    cr = r1 + (BS if dbr == 1 else -1)
-                    cc = c1 + (BS if dbc == 1 else -1)
-                    if 0 <= cr < N and 0 <= cc < N:
-                        refs.append((cr, cc, img[cr][cc]))
+                    cr2 = r1 + (BS if dbr == 1 else -1)
+                    cc2 = c1 + (BS if dbc == 1 else -1)
+                    if 0 <= cr2 < N and 0 <= cc2 < N:
+                        refs.append((cr2, cc2, img[cr2][cc2]))
 
-            # Quadrant averages
             quads = [
                 (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
                 (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9)]
@@ -151,16 +164,13 @@ class SubmissionStrategy(Strategy):
                 if v is not None:
                     q_info[q] = v
 
-            # Fill pixels
             for r in range(r1, r1 + BS):
                 for c in range(c1, c1 + BS):
-                    # Quadrant avg for this pixel
                     q_val = None
                     for qr1, qc1, qr2, qc2 in quads:
                         if qr1 <= r <= qr2 and qc1 <= c <= qc2 and (qr1, qc1, qr2, qc2) in q_info:
                             q_val = q_info[(qr1, qc1, qr2, qc2)]
                             break
-
                     if refs:
                         tw, tv = 0.0, 0.0
                         for rr, rc, rv in refs:
@@ -181,11 +191,10 @@ class SubmissionStrategy(Strategy):
                     else:
                         img[r][c] = block_avg
 
-            # Shift to match block average
             avg = self.recv_avgs.get((br, bc))
             if avg is not None:
-                b_sum = sum(img[r][c] for r in range(r1, r1+BS) for c in range(c1, c1+BS))
-                shift = avg - b_sum / (BS * BS)
+                bsum = sum(img[rr][cc] for rr in range(r1, r1+BS) for cc in range(c1, c1+BS))
+                shift = avg - bsum / (BS * BS)
                 if abs(shift) > 0.001:
                     for r in range(r1, r1 + BS):
                         for c in range(c1, c1 + BS):
