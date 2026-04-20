@@ -52,10 +52,15 @@ class SubmissionStrategy(Strategy):
                     self.missing.add((br, bc))
                 else:
                     s = 0.0
+                    cnt = 0
                     for r in range(br * 10, br * 10 + 10):
                         for c in range(bc * 10, bc * 10 + 10):
-                            s += corrupted[r][c]
-                    self.vis_means[(br, bc)] = s / 100.0
+                            v = corrupted[r][c]
+                            if v is not None:
+                                s += v
+                                cnt += 1
+                    if cnt > 0:
+                        self.vis_means[(br, bc)] = s / cnt
 
     def make_requests(self):
         try:
