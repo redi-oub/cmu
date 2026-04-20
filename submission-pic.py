@@ -1,4 +1,4 @@
-"""test3b + vis_means + neighbor avg + quadrant avgs."""
+"""+ vis_means + neighbor avg + quadrant avgs + opponent responses."""
 import sys
 
 # Try every possible way to get Strategy
@@ -105,32 +105,97 @@ class SubmissionStrategy(Strategy):
 
     def recover(self):
         N = 50
+        BS = 10
+        img = [[0.0] * N for _ in range(N)]
+        for r in range(N):
+            for c in range(N):
+                v = self.corrupted[r][c]
+                if v is not None:
+                    img[r][c] = float(v)
+
+        for br, bc in self.missing:
+            r1, c1 = br * BS, bc * BS
+            block_avg = self.recv_avgs.get((br, bc), self._neighbor_avg(br, bc))
+
+            # Collect border reference pixels from visible neighbors
+            refs = []
+            vis = self.vis_means
+            if br > 0 and (br - 1, bc) in vis:
+                for c in range(c1, c1 + BS):
+                    refs.append((r1 - 1, c, img[r1 - 1][c]))
+            if br < 4 and (br + 1, bc) in vis:
+                for c in range(c1, c1 + BS):
+                    refs.append((r1 + BS, c, img[r1 + BS][c]))
+            if bc > 0 and (br, bc - 1) in vis:
+                for r in range(r1, r1 + BS):
+                    refs.append((r, c1 - 1, img[r][c1 - 1]))
+            if bc < 4 and (br, bc + 1) in vis:
+                for r in range(r1, r1 + BS):
+                    refs.append((r, c1 + BS, img[r][c1 + BS]))
+            # Diagonal corners
+            for dbr, dbc in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                nbr, nbc = br + dbr, bc + dbc
+                if (nbr, nbc) in vis:
+                    cr = r1 + (BS if dbr == 1 else -1)
+                    cc = c1 + (BS if dbc == 1 else -1)
+                    if 0 <= cr < N and 0 <= cc < N:
+                        refs.append((cr, cc, img[cr][cc]))
+
+            # Quadrant averages
+            quads = [
+                (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
+                (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9)]
+            q_info = {}
+            for q in quads:
+                v = self.recv_avgs.get(q)
+                if v is not None:
+                    q_info[q] = v
+
+            # Fill pixels
+            for r in range(r1, r1 + BS):
+                for c in range(c1, c1 + BS):
+                    # Quadrant avg for this pixel
+                    q_val = None
+                    for qr1, qc1, qr2, qc2 in quads:
+                        if qr1 <= r <= qr2 and qc1 <= c <= qc2 and (qr1, qc1, qr2, qc2) in q_info:
+                            q_val = q_info[(qr1, qc1, qr2, qc2)]
+                            break
+
+                    if refs:
+                        tw, tv = 0.0, 0.0
+                        for rr, rc, rv in refs:
+                            d2 = (r - rr) ** 2 + (c - rc) ** 2
+                            if d2 == 0:
+                                tw, tv = 1.0, rv
+                                break
+                            w = 1.0 / d2
+                            tw += w
+                            tv += w * rv
+                        idw = tv / tw if tw > 0 else block_avg
+                        if q_val is not None:
+                            img[r][c] = 0.5 * idw + 0.5 * q_val
+                        else:
+                            img[r][c] = idw
+                    elif q_val is not None:
+                        img[r][c] = q_val
+                    else:
+                        img[r][c] = block_avg
+
+            # Shift to match block average
+            avg = self.recv_avgs.get((br, bc))
+            if avg is not None:
+                b_sum = sum(img[r][c] for r in range(r1, r1+BS) for c in range(c1, c1+BS))
+                shift = avg - b_sum / (BS * BS)
+                if abs(shift) > 0.001:
+                    for r in range(r1, r1 + BS):
+                        for c in range(c1, c1 + BS):
+                            img[r][c] = max(0.0, min(1.0, img[r][c] + shift))
+
         result = []
         for r in range(N):
             row = []
             for c in range(N):
-                v = self.corrupted[r][c]
-                if v is not None:
-                    row.append(v)
-                else:
-                    br, bc = r // 10, c // 10
-                    # Try quadrant avg first
-                    r1, c1 = br * 10, bc * 10
-                    qavg = None
-                    for qr1, qc1, qr2, qc2 in [
-                        (r1, c1, r1+4, c1+4), (r1, c1+5, r1+4, c1+9),
-                        (r1+5, c1, r1+9, c1+4), (r1+5, c1+5, r1+9, c1+9)]:
-                        if qr1 <= r <= qr2 and qc1 <= c <= qc2:
-                            qavg = self.recv_avgs.get((qr1, qc1, qr2, qc2))
-                            break
-                    if qavg is not None:
-                        row.append(qavg)
-                    else:
-                        avg = self.recv_avgs.get((br, bc))
-                        if avg is not None:
-                            row.append(avg)
-                        else:
-                            row.append(self._neighbor_avg(br, bc))
+                row.append(max(0.0, min(1.0, img[r][c])))
             result.append(row)
         return result
 
